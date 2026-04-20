@@ -15,6 +15,10 @@ COMFY="$WORKSPACE/ComfyUI"
 if [ -n "${TS_AUTHKEY:-}" ]; then
     log "installing Tailscale"
     curl -fsSL https://tailscale.com/install.sh | sh
+    # Start tailscaled manually — Docker containers don't have systemd
+    log "starting tailscaled"
+    tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
+    sleep 2
     log "joining tailnet as ${TS_HOSTNAME:-imagination}"
     tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-imagination}" --accept-routes
     TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
