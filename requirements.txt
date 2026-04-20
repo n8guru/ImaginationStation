@@ -1,0 +1,11 @@
+# ImaginationStation dependencies
+# Studio
+gradio
+openai
+requests
+python-dotenv
+
+# Ingest CLI
+typer
+httpx
+boto3

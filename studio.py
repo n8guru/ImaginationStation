@@ -219,6 +219,77 @@ def t_object_info():
     # Just names (full catalog is huge)
     return {"count": len(r), "names": sorted(r.keys())}
 
+# ---- Library tools (manifest-backed model search) ----
+
+MANIFEST_DB = Path("/workspace/library/manifest.db")
+
+def _get_manifest_conn():
+    """Open the manifest DB. Returns conn or None if not available."""
+    if not MANIFEST_DB.exists():
+        return None
+    import sqlite3
+    conn = sqlite3.connect(str(MANIFEST_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def t_search_library(query="", base_model="", category=""):
+    """Fuzzy search the model library manifest."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return {"error": "Manifest not available. Run model sync or ingest first."}
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from library.manifest import search
+    results = search(conn, query, base_model=base_model or None, category=category or None)
+    conn.close()
+    # Return concise results for LLM context
+    return [
+        {
+            "filename": r["filename"],
+            "display_name": r["display_name"],
+            "category": r["category"],
+            "base_model": r["base_model"],
+            "trigger_words": r["trigger_words"],
+            "weight_range": r["weight_range"],
+        }
+        for r in results
+    ]
+
+def t_get_lora_details(filename=""):
+    """Get full metadata for a model by filename."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return {"error": "Manifest not available."}
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from library.manifest import get_by_filename
+    result = get_by_filename(conn, filename)
+    conn.close()
+    if not result:
+        return {"error": f"'{filename}' not found in manifest."}
+    return result
+
+def t_list_checkpoints(base_model=""):
+    """List available checkpoints, optionally filtered by base model."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return {"error": "Manifest not available."}
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from library.manifest import list_checkpoints
+    results = list_checkpoints(conn, base_model=base_model or None)
+    conn.close()
+    return [
+        {
+            "filename": r["filename"],
+            "display_name": r["display_name"],
+            "base_model": r["base_model"],
+            "notes": r["notes"],
+        }
+        for r in results
+    ]
+
+
 TOOL_FNS = {
     "queue_workflow": t_queue_workflow,
     "get_queue_status": t_get_queue_status,
@@ -231,6 +302,9 @@ TOOL_FNS = {
     "gpu_status": t_gpu_status,
     "run_shell": t_run_shell,
     "object_info": t_object_info,
+    "search_library": t_search_library,
+    "get_lora_details": t_get_lora_details,
+    "list_checkpoints": t_list_checkpoints,
 }
 
 # ---- Tool schemas (OpenAI function-calling) ----
@@ -303,6 +377,30 @@ TOOLS = [
         "name": "object_info",
         "description": "Fetch all registered ComfyUI node class_type names (no schemas — just names).",
         "parameters": {"type": "object", "properties": {}}
+    }},
+    # Library tools (manifest-backed)
+    {"type": "function", "function": {
+        "name": "search_library",
+        "description": "Search the model library for LoRAs, checkpoints, embeddings, etc. Returns matching models with trigger words, weight ranges, and base model compatibility. Use this to find the right model for a generation task.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search term (name, style, concept, etc.)"},
+            "base_model": {"type": "string", "description": "Filter by base model: SDXL, Flux, SD1.5, Pony. Omit for all."},
+            "category": {"type": "string", "description": "Filter by type: lora, checkpoint, vae, controlnet, embedding. Omit for all."},
+        }}
+    }},
+    {"type": "function", "function": {
+        "name": "get_lora_details",
+        "description": "Get full metadata for a specific model by filename — trigger words, recommended weight range, base model, source, notes.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "Exact filename (e.g. 'anime_style.safetensors')"},
+        }, "required": ["filename"]}
+    }},
+    {"type": "function", "function": {
+        "name": "list_checkpoints",
+        "description": "List all available checkpoint models, optionally filtered by base model compatibility.",
+        "parameters": {"type": "object", "properties": {
+            "base_model": {"type": "string", "description": "Filter: SDXL, Flux, SD1.5, Pony. Omit for all."},
+        }}
     }},
 ]
 
@@ -446,6 +544,40 @@ def save_key(k):
             pass
     return gr.update()
 
+FORAGE_DROPLET = "http://jobscout.tail2b8e3e.ts.net:5001"
+
+def _get_ts_hostname():
+    """Read Tailscale hostname from env or persisted file."""
+    h = os.environ.get("TS_HOSTNAME", "")
+    if not h:
+        try:
+            h = Path("/workspace/.ts_hostname").read_text().strip()
+        except FileNotFoundError:
+            pass
+    return h
+
+def sync_to_n8razer():
+    """Call the Forage droplet to sync ComfyUI outputs to N8Razer's 10TB drive."""
+    ts_hostname = _get_ts_hostname()
+    if not ts_hostname:
+        return gr.update(value="No Tailscale hostname set (TS_HOSTNAME)", visible=True)
+    try:
+        r = requests.post(
+            f"{FORAGE_DROPLET}/imagination/gpu/sync",
+            json={"ts_hostname": ts_hostname},
+            timeout=300,
+        )
+        data = r.json()
+        if not r.ok:
+            return gr.update(value=f"Sync error: {data.get('error', 'unknown')}", visible=True)
+        msg = f"Synced {data['synced']} files, skipped {data['skipped']} existing"
+        if data.get("errors"):
+            msg += f", {len(data['errors'])} errors"
+        msg += f" → `{data.get('dest', '?')}`"
+        return gr.update(value=msg, visible=True)
+    except Exception as e:
+        return gr.update(value=f"Sync failed: {e}", visible=True)
+
 saved_key = API_KEY_FILE.read_text().strip() if API_KEY_FILE.exists() else ""
 
 # ---- UI ----
@@ -492,7 +624,11 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
             with gr.Accordion("Recent outputs", open=True):
                 gallery = gr.Gallery(value=refresh_gallery(), columns=4, height=240,
                                      show_label=False, allow_preview=True)
-                refresh_btn = gr.Button("Refresh", size="sm")
+                with gr.Row():
+                    refresh_btn = gr.Button("Refresh", size="sm", scale=1)
+                    sync_btn = gr.Button("💾 Save to N8Razer", size="sm", scale=1,
+                                          variant="secondary")
+                sync_status = gr.Markdown("", visible=False)
         # Right: ComfyUI iframe (80%)
         with gr.Column(scale=4, elem_id="comfyframe"):
             gr.HTML('<iframe src="http://localhost:8188" allow="clipboard-write"></iframe>')
@@ -504,6 +640,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
                [msg, chatbot, api_state]).then(refresh_gallery, None, gallery)
     clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
     refresh_btn.click(refresh_gallery, None, gallery)
+    sync_btn.click(sync_to_n8razer, None, sync_status)
     api_key.change(save_key, api_key, None)
     edit_key_btn.click(lambda: gr.update(visible=True), None, api_key)
 
