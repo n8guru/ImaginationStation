@@ -15,14 +15,29 @@ COMFY="$WORKSPACE/ComfyUI"
 if [ -n "${TS_AUTHKEY:-}" ]; then
     log "installing Tailscale"
     curl -fsSL https://tailscale.com/install.sh | sh
-    # Start tailscaled manually — Docker containers don't have systemd
+
+    # Start tailscaled manually — Docker containers lack systemd and /dev/net/tun.
+    # Use userspace networking (SOCKS proxy mode) if TUN device is unavailable.
     log "starting tailscaled"
-    tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
-    sleep 2
+    mkdir -p /var/lib/tailscale /var/run/tailscale
+    if [ -e /dev/net/tun ]; then
+        tailscaled --state=/var/lib/tailscale/tailscaled.state \
+                   --socket=/var/run/tailscale/tailscaled.sock &
+    else
+        warn "/dev/net/tun not available — using userspace networking"
+        tailscaled --state=/var/lib/tailscale/tailscaled.state \
+                   --socket=/var/run/tailscale/tailscaled.sock \
+                   --tun=userspace-networking --socks5-server=localhost:1055 &
+    fi
+    sleep 3
+
     log "joining tailnet as ${TS_HOSTNAME:-imagination}"
-    tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-imagination}" --accept-routes
-    TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
-    log "Tailscale up — IP: $TAILSCALE_IP"
+    if tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-imagination}" --accept-routes 2>&1; then
+        TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+        log "Tailscale up — IP: $TAILSCALE_IP"
+    else
+        warn "Tailscale failed to join — continuing without tailnet (services still accessible via public IP)"
+    fi
 fi
 
 # 1. OS packages
