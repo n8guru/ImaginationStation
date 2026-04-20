@@ -82,22 +82,64 @@ for url in "${KEY_NODES[@]}"; do
 done
 cd "$COMFY"
 
-# 4. Models — small starter set. Add more via the studio UI / install_model tool.
-mkdir -p models/{checkpoints,loras,controlnet,vae,text_encoders,flux}
+# 4. Models — sync from DO Spaces library (managed by ingest.py)
+mkdir -p models/{checkpoints,loras,controlnet,vae,text_encoders,flux,embeddings,upscalers}
 
-dl() {
-    local dest=$1 url=$2
-    if [ -f "$dest" ] && [ "$(stat -c%s "$dest")" -gt 1000000 ]; then
-        log "skip (exists): $dest"; return
+# Install s5cmd for fast parallel S3 sync
+if ! command -v s5cmd >/dev/null; then
+    log "installing s5cmd"
+    S5CMD_VERSION="2.2.2"
+    wget -qO /tmp/s5cmd.tar.gz "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_linux_amd64.tar.gz"
+    tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
+    rm /tmp/s5cmd.tar.gz
+fi
+
+# Sync models from Spaces if S3 creds are available
+if [ -n "${COMFY_S3_ACCESS_KEY:-}" ] && [ -n "${COMFY_S3_SECRET_KEY:-}" ]; then
+    BUCKET="${COMFY_S3_BUCKET:-imagination-models}"
+    ENDPOINT="${COMFY_S3_ENDPOINT:-https://sfo3.digitaloceanspaces.com}"
+
+    export AWS_ACCESS_KEY_ID="$COMFY_S3_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="$COMFY_S3_SECRET_KEY"
+    export S5CMD_ENDPOINT_URL="$ENDPOINT"
+
+    log "syncing models from s3://$BUCKET/models/ ..."
+    s5cmd sync "s3://${BUCKET}/models/*" models/ || warn "model sync failed (bucket may be empty)"
+
+    # Pull manifest
+    mkdir -p /workspace/library
+    s5cmd cp "s3://${BUCKET}/library/manifest.db" /workspace/library/manifest.db 2>/dev/null \
+        || warn "no manifest.db on Spaces yet (run ingest.py first)"
+
+    # Reconcile: log orphan files (in models/ but not in manifest)
+    if [ -f /workspace/library/manifest.db ]; then
+        log "reconciling models against manifest..."
+        cd "$COMFY"
+        "$COMFY/venv/bin/python" -c "
+import sys
+sys.path.insert(0, '$REPO_DIR')
+from library.manifest import open_db, reconcile
+conn = open_db('/workspace/library/manifest.db')
+result = reconcile(conn, '$COMFY/models')
+conn.close()
+if result['orphans']:
+    print(f'WARNING: {len(result[\"orphans\"])} orphan files in models/ without manifest rows:')
+    for o in result['orphans']:
+        print(f'  {o[\"spaces_key\"]} ({o[\"size\"]} bytes)')
+    print('These files were not ingested through the pipeline.')
+    print('Run: python ingest.py local <file> --base <model> --category <cat>')
+else:
+    print('All model files have manifest entries.')
+if result['missing']:
+    print(f'Note: {len(result[\"missing\"])} manifest entries without local files (may still be syncing).')
+" 2>&1 || warn "reconciliation check failed (non-fatal)"
     fi
-    log "downloading $dest"
-    wget --progress=dot:giga -O "$dest" "$url" || warn "download failed: $url"
-}
 
-dl models/checkpoints/Juggernaut-XL_v9.safetensors \
-   "https://civitai.com/api/download/models/288982?type=Model&format=SafeTensor&size=full&fp=fp16"
-dl models/flux/flux1-schnell-nf4.safetensors \
-   "https://huggingface.co/lllyasviel/flux1-schnell/resolve/main/flux1-schnell-nf4.safetensors?download=true"
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY S5CMD_ENDPOINT_URL
+else
+    warn "No S3 credentials — skipping model sync. Models dir will be empty."
+    warn "Set COMFY_S3_ACCESS_KEY and COMFY_S3_SECRET_KEY to enable library sync."
+fi
 
 cat > extra_model_paths.yaml << 'EOF'
 default:
@@ -108,6 +150,8 @@ default:
   vae: vae
   text_encoders: text_encoders
   flux: flux
+  embeddings: embeddings
+  upscalers: upscalers
 EOF
 
 # 5. Link in studio files from the repo

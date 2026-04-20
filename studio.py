@@ -219,6 +219,77 @@ def t_object_info():
     # Just names (full catalog is huge)
     return {"count": len(r), "names": sorted(r.keys())}
 
+# ---- Library tools (manifest-backed model search) ----
+
+MANIFEST_DB = Path("/workspace/library/manifest.db")
+
+def _get_manifest_conn():
+    """Open the manifest DB. Returns conn or None if not available."""
+    if not MANIFEST_DB.exists():
+        return None
+    import sqlite3
+    conn = sqlite3.connect(str(MANIFEST_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def t_search_library(query="", base_model="", category=""):
+    """Fuzzy search the model library manifest."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return {"error": "Manifest not available. Run model sync or ingest first."}
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from library.manifest import search
+    results = search(conn, query, base_model=base_model or None, category=category or None)
+    conn.close()
+    # Return concise results for LLM context
+    return [
+        {
+            "filename": r["filename"],
+            "display_name": r["display_name"],
+            "category": r["category"],
+            "base_model": r["base_model"],
+            "trigger_words": r["trigger_words"],
+            "weight_range": r["weight_range"],
+        }
+        for r in results
+    ]
+
+def t_get_lora_details(filename=""):
+    """Get full metadata for a model by filename."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return {"error": "Manifest not available."}
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from library.manifest import get_by_filename
+    result = get_by_filename(conn, filename)
+    conn.close()
+    if not result:
+        return {"error": f"'{filename}' not found in manifest."}
+    return result
+
+def t_list_checkpoints(base_model=""):
+    """List available checkpoints, optionally filtered by base model."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return {"error": "Manifest not available."}
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent))
+    from library.manifest import list_checkpoints
+    results = list_checkpoints(conn, base_model=base_model or None)
+    conn.close()
+    return [
+        {
+            "filename": r["filename"],
+            "display_name": r["display_name"],
+            "base_model": r["base_model"],
+            "notes": r["notes"],
+        }
+        for r in results
+    ]
+
+
 TOOL_FNS = {
     "queue_workflow": t_queue_workflow,
     "get_queue_status": t_get_queue_status,
@@ -231,6 +302,9 @@ TOOL_FNS = {
     "gpu_status": t_gpu_status,
     "run_shell": t_run_shell,
     "object_info": t_object_info,
+    "search_library": t_search_library,
+    "get_lora_details": t_get_lora_details,
+    "list_checkpoints": t_list_checkpoints,
 }
 
 # ---- Tool schemas (OpenAI function-calling) ----
@@ -303,6 +377,30 @@ TOOLS = [
         "name": "object_info",
         "description": "Fetch all registered ComfyUI node class_type names (no schemas — just names).",
         "parameters": {"type": "object", "properties": {}}
+    }},
+    # Library tools (manifest-backed)
+    {"type": "function", "function": {
+        "name": "search_library",
+        "description": "Search the model library for LoRAs, checkpoints, embeddings, etc. Returns matching models with trigger words, weight ranges, and base model compatibility. Use this to find the right model for a generation task.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Search term (name, style, concept, etc.)"},
+            "base_model": {"type": "string", "description": "Filter by base model: SDXL, Flux, SD1.5, Pony. Omit for all."},
+            "category": {"type": "string", "description": "Filter by type: lora, checkpoint, vae, controlnet, embedding. Omit for all."},
+        }}
+    }},
+    {"type": "function", "function": {
+        "name": "get_lora_details",
+        "description": "Get full metadata for a specific model by filename — trigger words, recommended weight range, base model, source, notes.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "Exact filename (e.g. 'anime_style.safetensors')"},
+        }, "required": ["filename"]}
+    }},
+    {"type": "function", "function": {
+        "name": "list_checkpoints",
+        "description": "List all available checkpoint models, optionally filtered by base model compatibility.",
+        "parameters": {"type": "object", "properties": {
+            "base_model": {"type": "string", "description": "Filter: SDXL, Flux, SD1.5, Pony. Omit for all."},
+        }}
     }},
 ]
 
