@@ -11,6 +11,16 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE=/workspace
 COMFY="$WORKSPACE/ComfyUI"
 
+# 0. Tailscale — join tailnet if auth key provided
+if [ -n "${TS_AUTHKEY:-}" ]; then
+    log "installing Tailscale"
+    curl -fsSL https://tailscale.com/install.sh | sh
+    log "joining tailnet as ${TS_HOSTNAME:-imagination}"
+    tailscale up --authkey="$TS_AUTHKEY" --hostname="${TS_HOSTNAME:-imagination}" --accept-routes
+    TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "pending")
+    log "Tailscale up — IP: $TAILSCALE_IP"
+fi
+
 # 1. OS packages
 log "apt packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -112,6 +122,15 @@ log "starting services"
 bash "$WORKSPACE/start_all.sh"
 
 PUBLIC_IP=$(curl -fsS --max-time 5 ifconfig.me || echo "<instance-ip>")
+TS_URL=""
+if command -v tailscale >/dev/null && tailscale status >/dev/null 2>&1; then
+    TS_HOST=$(tailscale status --json 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['Self']['DNSName'].rstrip('.'))" 2>/dev/null || echo "")
+    if [ -n "$TS_HOST" ]; then
+        TS_URL="  🔒 Tailscale Studio:        http://${TS_HOST}:3000
+  🔒 Tailscale ComfyUI:       http://${TS_HOST}:8188
+  🔒 Tailscale Rescue:        http://${TS_HOST}:7681"
+    fi
+fi
 cat <<DONE
 
 ===============================================================
@@ -120,6 +139,8 @@ cat <<DONE
   🎨 Studio (chat + ComfyUI):  http://${PUBLIC_IP}:3000
   🖼  ComfyUI direct:           http://${PUBLIC_IP}:8188
   🛟 Rescue terminal (Claude): http://${PUBLIC_IP}:7681
+${TS_URL:+---------------------------------------------------------------
+$TS_URL}
 ---------------------------------------------------------------
   tmux sessions: comfyui, studio, rescue
   Logs: /workspace/{comfy,studio}.log
