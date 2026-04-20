@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+*.log
+.openrouter_key
+.anthropic_key
+.env
+venv/
+models/

@@ -1,0 +1,473 @@
+"""
+ComfyUI Studio — LLM chat + ComfyUI iframe on one page.
+LLM (via OpenRouter) has tool-calling access to ComfyUI API + shell.
+"""
+import gradio as gr
+import os, json, time, subprocess, shlex, traceback
+from pathlib import Path
+import requests
+from openai import OpenAI
+
+# ---- Config ----
+COMFY_URL = "http://127.0.0.1:8188"
+COMFY_ROOT = Path("/workspace/ComfyUI")
+OUTPUT_DIR = COMFY_ROOT / "output"
+MODELS_DIR = COMFY_ROOT / "models"
+CUSTOM_NODES_DIR = COMFY_ROOT / "custom_nodes"
+API_KEY_FILE = Path("/workspace/.openrouter_key")
+DEFAULT_MODEL = "anthropic/claude-opus-4.6"
+
+def fetch_openrouter_models():
+    """Pull the full model list from OpenRouter. Tool-calling models surface first."""
+    try:
+        r = requests.get("https://openrouter.ai/api/v1/models", timeout=10)
+        data = r.json().get("data", [])
+        ids = []
+        for m in data:
+            mid = m.get("id")
+            if not mid:
+                continue
+            params = m.get("supported_parameters") or []
+            has_tools = "tools" in params or "tool_choice" in params
+            ids.append((not has_tools, mid.lower(), mid))  # tool-capable first, then alpha
+        ids.sort()
+        return [mid for _, _, mid in ids]
+    except Exception as e:
+        print(f"[warn] OpenRouter model fetch failed: {e}")
+        return [DEFAULT_MODEL, "anthropic/claude-opus-4.7", "anthropic/claude-sonnet-4.6",
+                "x-ai/grok-4-fast", "openai/gpt-5", "google/gemini-2.5-pro"]
+
+MODEL_CHOICES = fetch_openrouter_models()
+if DEFAULT_MODEL not in MODEL_CHOICES:
+    MODEL_CHOICES.insert(0, DEFAULT_MODEL)
+
+SYSTEM_PROMPT = """You are an autonomous ComfyUI operator running on an RTX 5090 (32GB VRAM) Linux box.
+ComfyUI is already running at http://127.0.0.1:8188 (its API). You have FULL shell access.
+
+Paths:
+  - Models: /workspace/ComfyUI/models/{checkpoints,loras,controlnet,vae,text_encoders,...}
+  - Custom nodes: /workspace/ComfyUI/custom_nodes/
+  - Outputs: /workspace/ComfyUI/output/
+  - ComfyUI venv python: /workspace/ComfyUI/venv/bin/python
+
+Installed checkpoints include: juggernaut_x_v10_nsfw.safetensors (SDXL, realistic, uncensored — good default).
+Installed custom nodes: ComfyUI-Manager, ComfyUI-AnimateDiff-Evolved, comfyui_controlnet_aux.
+
+RULES OF ENGAGEMENT:
+1. Execute — don't describe. When the user asks for an image, CALL queue_workflow. Do not print JSON for them to copy.
+2. Use list_models('checkpoints') before generating if unsure what's installed.
+3. Workflows use ComfyUI's API format: a dict of node_id -> {class_type, inputs}. Inputs that come from other nodes use [node_id, output_index].
+3a. EVERY workflow MUST include a terminal output node — typically SaveImage (inputs: images=[vae_decode_id,0], filename_prefix="..."). Without one ComfyUI rejects with "prompt_no_outputs". A minimal SDXL graph needs: CheckpointLoaderSimple → CLIPTextEncode (pos) + CLIPTextEncode (neg) → EmptyLatentImage → KSampler → VAEDecode → SaveImage.
+4. After queue_workflow, call wait_for_image(prompt_id) to block until done, then report the output filename.
+5. If a workflow fails, read the error from ComfyUI (run_shell: `tail /workspace/comfy.log`), fix, retry.
+6. If a node or model is missing, install it (install_custom_node / install_model), then retry. Some custom nodes require restarting ComfyUI — use run_shell to kill + relaunch the tmux session 'comfyui':
+     tmux kill-session -t comfyui
+     tmux new-session -d -s comfyui 'cd /workspace/ComfyUI && source venv/bin/activate && python main.py --listen 0.0.0.0 --port 8188 2>&1 | tee /workspace/comfy.log'
+7. Introspect if unsure: `curl -s http://127.0.0.1:8188/object_info | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d)[:50])"`.
+8. Be terse in chat. Tool output is shown separately — don't re-narrate it."""
+
+# ---- Tool implementations ----
+
+def t_queue_workflow(workflow):
+    r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code}", "body": r.text[:2000]}
+    return r.json()
+
+def t_get_queue_status():
+    return requests.get(f"{COMFY_URL}/queue", timeout=10).json()
+
+def t_get_history(n=5):
+    all_hist = requests.get(f"{COMFY_URL}/history", timeout=10).json()
+    ids = list(all_hist.keys())[-int(n):]
+    out = {}
+    for pid in ids:
+        h = all_hist[pid]
+        outs = h.get("outputs", {})
+        files = []
+        for node_id, node_out in outs.items():
+            for img in node_out.get("images", []):
+                files.append(img["filename"])
+        out[pid] = {"files": files, "status": h.get("status", {}).get("status_str", "unknown")}
+    return out
+
+def t_wait_for_image(prompt_id, timeout_s=180):
+    deadline = time.time() + int(timeout_s)
+    while time.time() < deadline:
+        h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
+        if prompt_id in h:
+            outputs = h[prompt_id].get("outputs", {})
+            files = []
+            for node_id, node_out in outputs.items():
+                for img in node_out.get("images", []):
+                    path = OUTPUT_DIR / img.get("subfolder", "") / img["filename"]
+                    files.append({
+                        "filename": img["filename"],
+                        "path": str(path),
+                        "view_url": f"{COMFY_URL}/view?filename={img['filename']}&subfolder={img.get('subfolder','')}&type={img.get('type','output')}",
+                    })
+            if files:
+                return {"status": "done", "files": files, "elapsed_s": round(time.time() - (deadline - int(timeout_s)), 1)}
+        time.sleep(1.5)
+    return {"status": "timeout", "after_s": timeout_s}
+
+def t_list_models(type="checkpoints"):
+    d = MODELS_DIR / type
+    if not d.exists():
+        return {"error": f"{d} not found", "available_types": [p.name for p in MODELS_DIR.iterdir() if p.is_dir()]}
+    files = []
+    for p in d.iterdir():
+        if p.is_file() and not p.name.startswith("put_"):
+            files.append({"name": p.name, "size_gb": round(p.stat().st_size / 1e9, 2)})
+    return files
+
+def t_install_model(url, dest_type, filename=None):
+    dest_dir = MODELS_DIR / dest_type
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    if not filename:
+        filename = url.rsplit("/", 1)[-1].split("?")[0]
+    dest = dest_dir / filename
+    tmux_name = f"dl_{int(time.time())}"
+    cmd = f"wget --progress=dot:giga -O {shlex.quote(str(dest))} {shlex.quote(url)} 2>&1 | tee /tmp/{tmux_name}.log"
+    subprocess.Popen(["tmux", "new-session", "-d", "-s", tmux_name, cmd])
+    return {
+        "status": "download_started",
+        "tmux_session": tmux_name,
+        "dest": str(dest),
+        "check_progress": f"run_shell: tail -5 /tmp/{tmux_name}.log",
+    }
+
+def t_list_custom_nodes():
+    return [p.name for p in CUSTOM_NODES_DIR.iterdir() if p.is_dir()]
+
+def t_install_custom_node(repo_url):
+    name = repo_url.rstrip("/").rsplit("/", 1)[-1].replace(".git", "")
+    dest = CUSTOM_NODES_DIR / name
+    if dest.exists():
+        return {"status": "already_installed", "name": name}
+    r = subprocess.run(["git", "clone", repo_url, str(dest)], capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        return {"status": "clone_failed", "stderr": r.stderr[-1000:]}
+    req = dest / "requirements.txt"
+    pip_tail = ""
+    if req.exists():
+        p = subprocess.run(
+            ["/workspace/ComfyUI/venv/bin/pip", "install", "-r", str(req)],
+            capture_output=True, text=True, timeout=600,
+        )
+        pip_tail = (p.stdout + p.stderr)[-800:]
+    return {
+        "status": "installed",
+        "name": name,
+        "pip_tail": pip_tail,
+        "note": "Restart ComfyUI to load the new node (see rule #6).",
+    }
+
+def t_gpu_status():
+    r = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu",
+         "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return r.stdout.strip()
+
+def t_run_shell(cmd, timeout_s=60):
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=int(timeout_s))
+        return {
+            "returncode": r.returncode,
+            "stdout": r.stdout[-3000:],
+            "stderr": r.stderr[-1500:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"error": f"timed out after {timeout_s}s"}
+
+def t_object_info():
+    """Fetch ComfyUI's node catalog (abbreviated) so you know what node class_types exist."""
+    r = requests.get(f"{COMFY_URL}/object_info", timeout=30).json()
+    # Just names (full catalog is huge)
+    return {"count": len(r), "names": sorted(r.keys())}
+
+TOOL_FNS = {
+    "queue_workflow": t_queue_workflow,
+    "get_queue_status": t_get_queue_status,
+    "get_history": t_get_history,
+    "wait_for_image": t_wait_for_image,
+    "list_models": t_list_models,
+    "install_model": t_install_model,
+    "list_custom_nodes": t_list_custom_nodes,
+    "install_custom_node": t_install_custom_node,
+    "gpu_status": t_gpu_status,
+    "run_shell": t_run_shell,
+    "object_info": t_object_info,
+}
+
+# ---- Tool schemas (OpenAI function-calling) ----
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "queue_workflow",
+        "description": "Submit a ComfyUI API-format workflow for execution. Returns prompt_id.",
+        "parameters": {"type": "object", "properties": {
+            "workflow": {"type": "object", "description": "Dict of node_id -> {class_type, inputs}. Inputs referencing other nodes are [node_id_string, output_index_int]."}
+        }, "required": ["workflow"]}
+    }},
+    {"type": "function", "function": {
+        "name": "get_queue_status",
+        "description": "Return ComfyUI's current queue (running + pending).",
+        "parameters": {"type": "object", "properties": {}}
+    }},
+    {"type": "function", "function": {
+        "name": "get_history",
+        "description": "Return the last N completed prompts and their output filenames.",
+        "parameters": {"type": "object", "properties": {"n": {"type": "integer", "default": 5}}}
+    }},
+    {"type": "function", "function": {
+        "name": "wait_for_image",
+        "description": "Poll /history/{prompt_id} until outputs appear or timeout. Returns file paths.",
+        "parameters": {"type": "object", "properties": {
+            "prompt_id": {"type": "string"},
+            "timeout_s": {"type": "integer", "default": 180}
+        }, "required": ["prompt_id"]}
+    }},
+    {"type": "function", "function": {
+        "name": "list_models",
+        "description": "List files in /workspace/ComfyUI/models/<type>/. type defaults to 'checkpoints'.",
+        "parameters": {"type": "object", "properties": {"type": {"type": "string", "default": "checkpoints"}}}
+    }},
+    {"type": "function", "function": {
+        "name": "install_model",
+        "description": "Start a wget download of a model into models/<dest_type>/<filename>. Returns immediately; check progress via run_shell.",
+        "parameters": {"type": "object", "properties": {
+            "url": {"type": "string"},
+            "dest_type": {"type": "string", "description": "e.g. checkpoints, loras, controlnet, vae, text_encoders"},
+            "filename": {"type": "string", "description": "Override filename (default: infer from URL)"}
+        }, "required": ["url", "dest_type"]}
+    }},
+    {"type": "function", "function": {
+        "name": "list_custom_nodes",
+        "description": "List installed custom nodes.",
+        "parameters": {"type": "object", "properties": {}}
+    }},
+    {"type": "function", "function": {
+        "name": "install_custom_node",
+        "description": "git clone a custom node into /workspace/ComfyUI/custom_nodes/ and pip install its requirements. Requires ComfyUI restart to activate.",
+        "parameters": {"type": "object", "properties": {
+            "repo_url": {"type": "string"}
+        }, "required": ["repo_url"]}
+    }},
+    {"type": "function", "function": {
+        "name": "gpu_status",
+        "description": "One-line nvidia-smi summary: name, mem used/total, util%, temp.",
+        "parameters": {"type": "object", "properties": {}}
+    }},
+    {"type": "function", "function": {
+        "name": "run_shell",
+        "description": "Run an arbitrary bash command. stdout/stderr truncated. Use for anything else.",
+        "parameters": {"type": "object", "properties": {
+            "cmd": {"type": "string"},
+            "timeout_s": {"type": "integer", "default": 60}
+        }, "required": ["cmd"]}
+    }},
+    {"type": "function", "function": {
+        "name": "object_info",
+        "description": "Fetch all registered ComfyUI node class_type names (no schemas — just names).",
+        "parameters": {"type": "object", "properties": {}}
+    }},
+]
+
+def dispatch(name, args):
+    fn = TOOL_FNS.get(name)
+    if not fn:
+        return {"error": f"unknown tool: {name}"}
+    try:
+        return fn(**args)
+    except TypeError as e:
+        return {"error": f"bad args: {e}", "got": args}
+    except Exception as e:
+        return {"error": str(e), "type": type(e).__name__, "tb": traceback.format_exc()[-1000:]}
+
+# ---- Chat loop ----
+MAX_STEPS = 12
+
+def chat(user_msg, display_hist, api_hist, api_key, model):
+    if not user_msg.strip():
+        yield "", display_hist, api_hist
+        return
+    if not api_key:
+        display_hist = display_hist + [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": "⚠️ Enter your OpenRouter API key above first."}
+        ]
+        yield "", display_hist, api_hist
+        return
+
+    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+
+    # Seed api_hist with system prompt if empty
+    if not api_hist:
+        api_hist = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    api_hist = api_hist + [{"role": "user", "content": user_msg}]
+    display_hist = display_hist + [{"role": "user", "content": user_msg}]
+    yield "", display_hist, api_hist
+
+    for step in range(MAX_STEPS):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=api_hist,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.7,
+                max_tokens=4096,
+            )
+        except Exception as e:
+            display_hist = display_hist + [{"role": "assistant", "content": f"❌ API error: {e}"}]
+            yield "", display_hist, api_hist
+            return
+
+        m = resp.choices[0].message
+        # Append the assistant message (with tool_calls if any) to API history
+        assistant_entry = {"role": "assistant", "content": m.content or ""}
+        if m.tool_calls:
+            assistant_entry["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in m.tool_calls
+            ]
+        api_hist = api_hist + [assistant_entry]
+
+        # Show any text the assistant emitted before/alongside the tool calls
+        if m.content:
+            display_hist = display_hist + [{"role": "assistant", "content": m.content}]
+            yield "", display_hist, api_hist
+
+        if not m.tool_calls:
+            return  # final answer already displayed
+
+        # Execute tools
+        for tc in m.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            # Show a "calling..." message
+            pretty_args = json.dumps(args, indent=2)[:400]
+            display_hist = display_hist + [{
+                "role": "assistant",
+                "content": f"🔧 **{name}** `{pretty_args}`"
+            }]
+            yield "", display_hist, api_hist
+
+            result = dispatch(name, args)
+            result_str = json.dumps(result, default=str)[:8000]
+
+            api_hist = api_hist + [{
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result_str,
+            }]
+
+            # Condensed display
+            preview = json.dumps(result, default=str, indent=2)
+            if len(preview) > 800:
+                preview = preview[:800] + "\n…(truncated)"
+            display_hist = display_hist + [{
+                "role": "assistant",
+                "content": f"↳ `{name}` result:\n```json\n{preview}\n```"
+            }]
+            yield "", display_hist, api_hist
+
+    display_hist = display_hist + [{"role": "assistant", "content": "⚠️ Max tool-call steps reached."}]
+    yield "", display_hist, api_hist
+
+
+# ---- Gallery helpers ----
+def refresh_gallery():
+    if not OUTPUT_DIR.exists():
+        return []
+    files = sorted(
+        [p for p in OUTPUT_DIR.rglob("*") if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")],
+        key=lambda p: p.stat().st_mtime, reverse=True,
+    )[:12]
+    return [str(p) for p in files]
+
+def save_key(k):
+    if k:
+        try:
+            API_KEY_FILE.write_text(k.strip())
+        except Exception:
+            pass
+    return gr.update()
+
+saved_key = API_KEY_FILE.read_text().strip() if API_KEY_FILE.exists() else ""
+
+# ---- UI ----
+CSS = """
+footer {display:none !important}
+.gradio-container {max-width: 100% !important; padding: 8px !important;}
+.gradio-container > .main, .gradio-container .contain {max-width: 100% !important; padding: 0 !important;}
+#comfyframe {min-height: 900px;}
+#comfyframe iframe {width: 100%; height: 900px; border: 1px solid #444; border-radius: 8px;}
+.chatbot {height: 560px !important;}
+"""
+
+with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
+    gr.Markdown("## 🎨 ComfyUI Studio — chat + canvas")
+    api_state = gr.State([])
+
+    with gr.Row():
+        # Left: chat (20%)
+        with gr.Column(scale=1, min_width=320):
+            with gr.Row():
+                model_pick = gr.Dropdown(
+                    choices=MODEL_CHOICES, value=DEFAULT_MODEL, label="Model",
+                    filterable=True, allow_custom_value=True, scale=4,
+                )
+                edit_key_btn = gr.Button("🔑", scale=0, min_width=44,
+                                         visible=bool(saved_key))
+            api_key = gr.Textbox(
+                value=saved_key, label="OpenRouter Key", type="password",
+                visible=not bool(saved_key),
+            )
+            chatbot = gr.Chatbot(elem_classes=["chatbot"], show_label=False,
+                                 avatar_images=(None, "https://openrouter.ai/favicon.ico"))
+            msg = gr.Textbox(placeholder="e.g., Generate a cyberpunk portrait at 1024x1024 with Juggernaut",
+                             lines=2, show_label=False)
+            with gr.Row():
+                send_btn = gr.Button("Send", variant="primary", scale=3)
+                clear_btn = gr.Button("Clear", scale=1)
+            gr.HTML(
+                '<a href="http://localhost:7681" target="_blank" rel="noopener" '
+                'style="display:block;text-align:center;padding:8px 12px;margin-top:4px;'
+                'background:#b33;color:#fff;border-radius:6px;text-decoration:none;'
+                'font-weight:600;">🛟 Rescue terminal (Claude Code)</a>'
+            )
+            with gr.Accordion("Recent outputs", open=True):
+                gallery = gr.Gallery(value=refresh_gallery(), columns=4, height=240,
+                                     show_label=False, allow_preview=True)
+                refresh_btn = gr.Button("Refresh", size="sm")
+        # Right: ComfyUI iframe (80%)
+        with gr.Column(scale=4, elem_id="comfyframe"):
+            gr.HTML('<iframe src="http://localhost:8188" allow="clipboard-write"></iframe>')
+
+    # Wiring
+    send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick],
+                   [msg, chatbot, api_state]).then(refresh_gallery, None, gallery)
+    msg.submit(chat, [msg, chatbot, api_state, api_key, model_pick],
+               [msg, chatbot, api_state]).then(refresh_gallery, None, gallery)
+    clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
+    refresh_btn.click(refresh_gallery, None, gallery)
+    api_key.change(save_key, api_key, None)
+    edit_key_btn.click(lambda: gr.update(visible=True), None, api_key)
+
+if __name__ == "__main__":
+    demo.queue().launch(
+        server_name="0.0.0.0",
+        server_port=3000,
+        share=False,
+        allowed_paths=[str(OUTPUT_DIR)],
+        css=CSS,
+        theme=gr.themes.Soft(),
+    )
