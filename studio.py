@@ -66,6 +66,37 @@ RULES OF ENGAGEMENT:
 7. Introspect if unsure: `curl -s http://127.0.0.1:8188/object_info | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d)[:50])"`.
 8. Be terse in chat. Tool output is shown separately — don't re-narrate it."""
 
+# Grok-specific: stricter template. Grok struggles with open-ended workflow
+# construction, so we hand it an exact skeleton and ask it to substitute.
+GROK_SYSTEM_PROMPT = """You generate ComfyUI workflows by CALLING the queue_workflow tool. Always pass this exact structure as the `workflow` argument, substituting the bracketed placeholders:
+
+{
+  "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "juggernaut_x_v10_nsfw.safetensors"}},
+  "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "[USER PROMPT HERE]", "clip": ["1", 1]}},
+  "3": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, ugly, deformed", "clip": ["1", 1]}},
+  "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+  "5": {"class_type": "KSampler", "inputs": {"seed": [RANDOM], "steps": 25, "cfg": 7, "sampler_name": "euler_a", "scheduler": "normal", "denoise": 1, "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]}},
+  "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+  "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "[SUBJECT]", "images": ["6", 0]}}
+}
+
+Rules:
+- Node 2 text = user's creative prompt
+- Node 7 filename_prefix = subject name (lowercase, no spaces)
+- Seed = random integer 1-9999999
+- Call queue_workflow with this dict as the `workflow` argument — do not print JSON to chat
+- For NSFW: prepend "score_9, score_8_up, explicit" to node 2 text
+- After queue_workflow returns a prompt_id, call wait_for_image(prompt_id), then report the filename briefly
+
+Example: User says "snowman" → node 2 text = "cheerful snowman with carrot nose, winter scene, 4k", node 7 filename_prefix = "snowman"
+"""
+
+def system_prompt_for(model: str) -> str:
+    """Route to a model-specific system prompt. Grok gets the rigid template."""
+    if "grok" in (model or "").lower():
+        return GROK_SYSTEM_PROMPT
+    return SYSTEM_PROMPT
+
 # ---- Tool implementations ----
 
 def t_queue_workflow(workflow):
@@ -303,9 +334,11 @@ def chat(user_msg, display_hist, api_hist, api_key, model):
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
-    # Seed api_hist with system prompt if empty
+    # Seed api_hist with system prompt if empty.
+    # NOTE: the prompt is chosen per-model at seed time. To switch prompts
+    # when you change models mid-session, hit Clear first.
     if not api_hist:
-        api_hist = [{"role": "system", "content": SYSTEM_PROMPT}]
+        api_hist = [{"role": "system", "content": system_prompt_for(model)}]
 
     api_hist = api_hist + [{"role": "user", "content": user_msg}]
     display_hist = display_hist + [{"role": "user", "content": user_msg}]
@@ -323,6 +356,18 @@ def chat(user_msg, display_hist, api_hist, api_key, model):
             )
         except Exception as e:
             display_hist = display_hist + [{"role": "assistant", "content": f"❌ API error: {e}"}]
+            yield "", display_hist, api_hist
+            return
+
+        # OpenRouter can return a 200 with no `.choices` (e.g. upstream rate-limit,
+        # content filter, invalid model slug). Surface the underlying error instead
+        # of crashing with NoneType[0].
+        if not getattr(resp, "choices", None):
+            err = getattr(resp, "error", None) or getattr(resp, "model_dump", lambda: {})()
+            display_hist = display_hist + [{
+                "role": "assistant",
+                "content": f"❌ OpenRouter returned no choices for `{model}`:\n```\n{err}\n```",
+            }]
             yield "", display_hist, api_hist
             return
 
