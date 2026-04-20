@@ -107,10 +107,9 @@ mkdir -p models/{checkpoints,loras,controlnet,vae,text_encoders,flux,embeddings,
 # Install s5cmd for fast parallel S3 sync
 if ! command -v s5cmd >/dev/null; then
     log "installing s5cmd"
-    S5CMD_VERSION="2.2.2"
-    wget -qO /tmp/s5cmd.tar.gz "https://github.com/peak/s5cmd/releases/download/v${S5CMD_VERSION}/s5cmd_${S5CMD_VERSION}_linux_amd64.tar.gz"
-    tar -xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
-    rm /tmp/s5cmd.tar.gz
+    curl -fsSL -o /tmp/s5cmd.deb "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_linux_amd64.deb"
+    dpkg -i /tmp/s5cmd.deb
+    rm -f /tmp/s5cmd.deb
 fi
 
 # Sync models from Spaces if S3 creds are available
