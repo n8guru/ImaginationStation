@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from library.manifest import (
     open_db, add_model, get_by_sha256, hash_file,
     push_manifest, pull_manifest, upload_model_file, upload_preview,
-    DEFAULT_DB_PATH,
+    stream_upload, DEFAULT_DB_PATH,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
@@ -102,29 +102,27 @@ def civitai(
     meta = fetch_model(model_id, token=token)
     logger.info("Found: %s (%s, %s)", meta["name"], meta["category"], meta["base_model"])
 
-    # Download to temp
-    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
-        tmp_path = tmp.name
+    # SHA-256 dedupe using API-provided hash (no download needed)
+    sha = meta.get("sha256", "")
+    if sha:
+        existing = get_by_sha256(conn, sha)
+        if existing:
+            logger.info("DUPLICATE: sha256 %s already in manifest as '%s'. Skipping.",
+                         sha[:12], existing["display_name"])
+            conn.close()
+            raise typer.Exit(0)
 
-    logger.info("Downloading %s...", meta["filename"])
-    download_file(meta["download_url"], tmp_path, token=token)
-
-    # SHA-256 dedupe
-    sha = hash_file(tmp_path)
-    existing = get_by_sha256(conn, sha)
-    if existing:
-        logger.info("DUPLICATE: sha256 %s already in manifest as '%s'. Skipping.",
-                     sha[:12], existing["display_name"])
-        os.unlink(tmp_path)
-        conn.close()
-        raise typer.Exit(0)
-
-    # Upload to Spaces
+    # Stream directly to Spaces (no local temp file)
     subdir = _category_to_subdir(meta["category"])
     spaces_key = f"models/{subdir}/{meta['filename']}"
-    logger.info("Uploading to s3://%s...", spaces_key)
-    upload_model_file(tmp_path, spaces_key)
-    os.unlink(tmp_path)
+    dl_headers = {"Authorization": f"Bearer {token}"} if token else {}
+    logger.info("Streaming to s3://%s...", spaces_key)
+    stream_upload(meta["download_url"], spaces_key, headers=dl_headers)
+
+    # If CivitAI didn't provide a hash, we can't verify — use a placeholder
+    if not sha:
+        logger.warning("CivitAI did not provide SHA-256 for model %d — using source_id as fallback key", model_id)
+        sha = f"civitai-{model_id}-{meta.get('version_id', 'unknown')}"
 
     # Preview
     preview_path = _ingest_preview(meta["preview_url"], sha, f"civitai:{model_id}")
@@ -200,29 +198,15 @@ def hf(
     if triggers:
         meta["trigger_words"] = triggers
 
-    # Download to temp
-    with tempfile.NamedTemporaryFile(suffix=".safetensors", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    logger.info("Downloading %s...", meta["filename"])
-    download_file(meta["download_url"], tmp_path, token=token)
-
-    # SHA-256 dedupe
-    sha = hash_file(tmp_path)
-    existing = get_by_sha256(conn, sha)
-    if existing:
-        logger.info("DUPLICATE: sha256 %s already in manifest as '%s'. Skipping.",
-                     sha[:12], existing["display_name"])
-        os.unlink(tmp_path)
-        conn.close()
-        raise typer.Exit(0)
-
-    # Upload to Spaces
+    # Stream directly to Spaces (no local temp file)
     subdir = _category_to_subdir(meta["category"])
     spaces_key = f"models/{subdir}/{meta['filename']}"
-    logger.info("Uploading to s3://%s...", spaces_key)
-    upload_model_file(tmp_path, spaces_key)
-    os.unlink(tmp_path)
+    dl_headers = {"Authorization": f"Bearer {token}"} if token else {}
+    logger.info("Streaming to s3://%s...", spaces_key)
+    stream_upload(meta["download_url"], spaces_key, headers=dl_headers)
+
+    # HF doesn't provide pre-download hashes easily — use repo ID as dedupe key
+    sha = f"hf-{meta['source_id'].replace('/', '-')}"
 
     # Preview
     preview_path = _ingest_preview(meta.get("preview_url"), sha, f"hf:{repo_file}")

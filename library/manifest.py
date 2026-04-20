@@ -252,12 +252,82 @@ def pull_manifest(db_path=None):
 
 
 def upload_model_file(local_path, spaces_key):
-    """Upload a model file to DO Spaces."""
+    """Upload a model file to DO Spaces from a local path."""
     s3, bucket = _get_s3()
     if not s3:
         raise RuntimeError("S3 not configured")
     logger.info("Uploading %s → s3://%s/%s", local_path, bucket, spaces_key)
     s3.upload_file(str(local_path), bucket, spaces_key)
+
+
+def stream_upload(download_url, spaces_key, headers=None):
+    """Stream a file from a URL directly to DO Spaces via S3 multipart upload.
+
+    Uses chunked download + multipart upload to avoid buffering the whole
+    file in memory. Handles multi-GB model files on low-RAM machines.
+    """
+    import httpx
+
+    s3, bucket = _get_s3()
+    if not s3:
+        raise RuntimeError("S3 not configured")
+
+    logger.info("Streaming %s → s3://%s/%s", download_url, bucket, spaces_key)
+
+    CHUNK_SIZE = 16 * 1024 * 1024  # 16MB parts (DO Spaces minimum is 5MB)
+
+    # Start multipart upload
+    mpu = s3.create_multipart_upload(Bucket=bucket, Key=spaces_key)
+    upload_id = mpu["UploadId"]
+
+    parts = []
+    part_num = 1
+    total_bytes = 0
+
+    try:
+        with httpx.stream("GET", download_url, headers=headers or {},
+                          timeout=600, follow_redirects=True) as resp:
+            resp.raise_for_status()
+            buf = b""
+            for chunk in resp.iter_bytes(65536):
+                buf += chunk
+                while len(buf) >= CHUNK_SIZE:
+                    part_data = buf[:CHUNK_SIZE]
+                    buf = buf[CHUNK_SIZE:]
+                    from io import BytesIO
+                    r = s3.upload_part(
+                        Bucket=bucket, Key=spaces_key,
+                        UploadId=upload_id, PartNumber=part_num,
+                        Body=BytesIO(part_data),
+                    )
+                    parts.append({"ETag": r["ETag"], "PartNumber": part_num})
+                    total_bytes += len(part_data)
+                    part_num += 1
+
+            # Upload remaining bytes
+            if buf:
+                from io import BytesIO
+                r = s3.upload_part(
+                    Bucket=bucket, Key=spaces_key,
+                    UploadId=upload_id, PartNumber=part_num,
+                    Body=BytesIO(buf),
+                )
+                parts.append({"ETag": r["ETag"], "PartNumber": part_num})
+                total_bytes += len(buf)
+
+        # Complete multipart upload
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=spaces_key, UploadId=upload_id,
+            MultipartUpload={"Parts": parts},
+        )
+        logger.info("Streamed %d bytes (%d parts) to s3://%s/%s",
+                     total_bytes, len(parts), bucket, spaces_key)
+        return total_bytes
+
+    except Exception:
+        # Abort on failure to avoid orphaned parts
+        s3.abort_multipart_upload(Bucket=bucket, Key=spaces_key, UploadId=upload_id)
+        raise
 
 
 def upload_preview(local_path, sha256):

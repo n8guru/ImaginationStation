@@ -81,6 +81,10 @@ def fetch_model(model_id, token=None):
     download_url = model_file.get("downloadUrl", ver.get("downloadUrl", ""))
     filename = model_file.get("name", f"civitai_{model_id}.safetensors")
 
+    # SHA-256 from API (avoids downloading just to hash)
+    hashes = model_file.get("hashes", {})
+    sha256 = (hashes.get("SHA256") or "").lower()
+
     # Preview image — first non-NSFW image, or first image
     images = ver.get("images", [])
     preview_url = None
@@ -99,6 +103,7 @@ def fetch_model(model_id, token=None):
         "trigger_words": trigger_words,
         "download_url": download_url,
         "filename": filename,
+        "sha256": sha256,
         "preview_url": preview_url,
         "source": "civitai",
         "source_id": str(model_id),
