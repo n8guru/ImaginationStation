@@ -446,6 +446,40 @@ def save_key(k):
             pass
     return gr.update()
 
+FORAGE_DROPLET = "http://jobscout.tail2b8e3e.ts.net:5001"
+
+def _get_ts_hostname():
+    """Read Tailscale hostname from env or persisted file."""
+    h = os.environ.get("TS_HOSTNAME", "")
+    if not h:
+        try:
+            h = Path("/workspace/.ts_hostname").read_text().strip()
+        except FileNotFoundError:
+            pass
+    return h
+
+def sync_to_n8razer():
+    """Call the Forage droplet to sync ComfyUI outputs to N8Razer's 10TB drive."""
+    ts_hostname = _get_ts_hostname()
+    if not ts_hostname:
+        return gr.update(value="No Tailscale hostname set (TS_HOSTNAME)", visible=True)
+    try:
+        r = requests.post(
+            f"{FORAGE_DROPLET}/imagination/gpu/sync",
+            json={"ts_hostname": ts_hostname},
+            timeout=300,
+        )
+        data = r.json()
+        if not r.ok:
+            return gr.update(value=f"Sync error: {data.get('error', 'unknown')}", visible=True)
+        msg = f"Synced {data['synced']} files, skipped {data['skipped']} existing"
+        if data.get("errors"):
+            msg += f", {len(data['errors'])} errors"
+        msg += f" → `{data.get('dest', '?')}`"
+        return gr.update(value=msg, visible=True)
+    except Exception as e:
+        return gr.update(value=f"Sync failed: {e}", visible=True)
+
 saved_key = API_KEY_FILE.read_text().strip() if API_KEY_FILE.exists() else ""
 
 # ---- UI ----
@@ -492,7 +526,11 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
             with gr.Accordion("Recent outputs", open=True):
                 gallery = gr.Gallery(value=refresh_gallery(), columns=4, height=240,
                                      show_label=False, allow_preview=True)
-                refresh_btn = gr.Button("Refresh", size="sm")
+                with gr.Row():
+                    refresh_btn = gr.Button("Refresh", size="sm", scale=1)
+                    sync_btn = gr.Button("💾 Save to N8Razer", size="sm", scale=1,
+                                          variant="secondary")
+                sync_status = gr.Markdown("", visible=False)
         # Right: ComfyUI iframe (80%)
         with gr.Column(scale=4, elem_id="comfyframe"):
             gr.HTML('<iframe src="http://localhost:8188" allow="clipboard-write"></iframe>')
@@ -504,6 +542,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
                [msg, chatbot, api_state]).then(refresh_gallery, None, gallery)
     clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
     refresh_btn.click(refresh_gallery, None, gallery)
+    sync_btn.click(sync_to_n8razer, None, sync_status)
     api_key.change(save_key, api_key, None)
     edit_key_btn.click(lambda: gr.update(visible=True), None, api_key)
 
