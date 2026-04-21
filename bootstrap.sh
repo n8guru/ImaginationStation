@@ -119,14 +119,14 @@ if [ -n "${COMFY_S3_ACCESS_KEY:-}" ] && [ -n "${COMFY_S3_SECRET_KEY:-}" ]; then
 
     export AWS_ACCESS_KEY_ID="$COMFY_S3_ACCESS_KEY"
     export AWS_SECRET_ACCESS_KEY="$COMFY_S3_SECRET_KEY"
-    export S5CMD_ENDPOINT_URL="$ENDPOINT"
+    S5="s5cmd --endpoint-url $ENDPOINT"
 
     log "syncing models from s3://$BUCKET/models/ ..."
-    s5cmd sync "s3://${BUCKET}/models/*" models/ || warn "model sync failed (bucket may be empty)"
+    $S5 sync "s3://${BUCKET}/models/*" models/ || warn "model sync failed (bucket may be empty)"
 
     # Pull manifest
     mkdir -p /workspace/library
-    s5cmd cp "s3://${BUCKET}/library/manifest.db" /workspace/library/manifest.db 2>/dev/null \
+    $S5 cp "s3://${BUCKET}/library/manifest.db" /workspace/library/manifest.db 2>/dev/null \
         || warn "no manifest.db on Spaces yet (run ingest.py first)"
 
     # Reconcile: log orphan files (in models/ but not in manifest)
@@ -153,7 +153,7 @@ if result['missing']:
 " 2>&1 || warn "reconciliation check failed (non-fatal)"
     fi
 
-    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY S5CMD_ENDPOINT_URL
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 else
     warn "No S3 credentials — skipping model sync. Models dir will be empty."
     warn "Set COMFY_S3_ACCESS_KEY and COMFY_S3_SECRET_KEY to enable library sync."

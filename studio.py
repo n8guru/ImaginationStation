@@ -15,7 +15,7 @@ OUTPUT_DIR = COMFY_ROOT / "output"
 MODELS_DIR = COMFY_ROOT / "models"
 CUSTOM_NODES_DIR = COMFY_ROOT / "custom_nodes"
 API_KEY_FILE = Path("/workspace/.openrouter_key")
-DEFAULT_MODEL = "anthropic/claude-opus-4.6"
+DEFAULT_MODEL = "deepseek/deepseek-v3.2"
 
 def fetch_openrouter_models():
     """Pull the full model list from OpenRouter. Tool-calling models surface first."""
@@ -416,7 +416,7 @@ def dispatch(name, args):
         return {"error": str(e), "type": type(e).__name__, "tb": traceback.format_exc()[-1000:]}
 
 # ---- Chat loop ----
-MAX_STEPS = 12
+MAX_STEPS = 50
 
 def chat(user_msg, display_hist, api_hist, api_key, model):
     if not user_msg.strip():
@@ -533,8 +533,8 @@ def refresh_gallery():
     files = sorted(
         [p for p in OUTPUT_DIR.rglob("*") if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")],
         key=lambda p: p.stat().st_mtime, reverse=True,
-    )[:12]
-    return [str(p) for p in files]
+    )[:60]
+    return [(str(p), p.name) for p in files]
 
 def save_key(k):
     if k:
@@ -622,7 +622,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
                 'font-weight:600;">🛟 Rescue terminal (Claude Code)</a>'
             )
             with gr.Accordion("Recent outputs", open=True):
-                gallery = gr.Gallery(value=refresh_gallery(), columns=4, height=240,
+                gallery = gr.Gallery(value=refresh_gallery(), columns=4, height=480,
                                      show_label=False, allow_preview=True)
                 with gr.Row():
                     refresh_btn = gr.Button("Refresh", size="sm", scale=1)
@@ -631,7 +631,9 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
                 sync_status = gr.Markdown("", visible=False)
         # Right: ComfyUI iframe (80%)
         with gr.Column(scale=4, elem_id="comfyframe"):
-            gr.HTML('<iframe src="http://localhost:8188" allow="clipboard-write"></iframe>')
+            _comfy_host = _get_ts_hostname() or "localhost"
+            _comfy_url = f"http://{_comfy_host}.tail2b8e3e.ts.net:8188" if _comfy_host and _comfy_host != "localhost" else "http://localhost:8188"
+            gr.HTML(f'<iframe src="{_comfy_url}" allow="clipboard-write"></iframe>')
 
     # Wiring
     send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick],
