@@ -882,8 +882,12 @@ def refresh_output_html():
        onclick="event.stopPropagation();openLightbox(this.src)" loading="lazy">
   <div style="display:flex;align-items:center;gap:4px;padding:3px 2px 0;">
     <input type="checkbox" class="out-check" onclick="event.stopPropagation();toggleSelect(this.closest('.out-card'))"
-           style="margin:0;accent-color:#4a9eff;">
-    <span style="font-family:monospace;font-size:11px;color:#aaa;user-select:all;word-break:break-all;">{name}</span>
+           style="margin:0;flex-shrink:0;accent-color:#4a9eff;">
+    <span style="font-family:monospace;font-size:11px;color:#aaa;user-select:all;word-break:break-all;flex:1;min-width:0;">{name}</span>
+    <span class="del-btn" onclick="event.stopPropagation();deleteFile('{name}')"
+          style="flex-shrink:0;cursor:pointer;font-size:14px;opacity:0.4;padding:0 2px;"
+          onmouseenter="this.style.opacity='1';this.style.color='#e55'"
+          onmouseleave="this.style.opacity='0.4';this.style.color=''">&#128465;</span>
   </div>
   {details_html}
 </div>''')
@@ -913,6 +917,11 @@ function openLightbox(src) {
   img.style.cssText = 'max-width:95vw;max-height:95vh;border-radius:8px;';
   overlay.appendChild(img);
   document.body.appendChild(overlay);
+}
+function deleteFile(name) {
+  if (!confirm('Delete ' + name + '?')) return;
+  const el = document.querySelector('#delete-trigger textarea');
+  if (el) { el.value = name; el.dispatchEvent(new Event('input', {bubbles:true})); }
 }
 function clearSelections() {
   document.querySelectorAll('.out-card.selected').forEach(c => {
@@ -967,6 +976,17 @@ def sync_to_n8razer():
         return gr.update(value=msg, visible=True)
     except Exception as e:
         return gr.update(value=f"Sync failed: {e}", visible=True)
+
+def delete_output_file(filename):
+    """Delete a file from the output directory."""
+    if not filename or not filename.strip():
+        return ""
+    name = filename.strip()
+    target = OUTPUT_DIR / name
+    if target.exists() and str(target).startswith(str(OUTPUT_DIR)):
+        target.unlink()
+        _meta_cache.pop(str(target), None)
+    return ""
 
 def add_reference_images(file_list):
     """Copy uploaded reference images into the ComfyUI output dir so they appear in the strip."""
@@ -1035,6 +1055,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
             output_html = gr.HTML(value=refresh_output_html() + OUTPUT_STRIP_JS,
                                   elem_id="output-html")
             selected_state = gr.Textbox(value="", visible=False, elem_id="selected-files-state")
+            delete_trigger = gr.Textbox(value="", visible=False, elem_id="delete-trigger")
             ref_upload = gr.File(label="Add reference images", file_count="multiple",
                                  file_types=["image"], height=60)
             with gr.Row():
@@ -1067,6 +1088,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
     clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
     refresh_btn.click(_refresh_html, None, output_html)
     ref_upload.change(add_reference_images, ref_upload, ref_upload).then(_refresh_html, None, output_html)
+    delete_trigger.change(delete_output_file, delete_trigger, delete_trigger).then(_refresh_html, None, output_html)
     deselect_btn.click(lambda: "", None, selected_state, js="() => { clearSelections(); }")
     sync_btn.click(sync_to_n8razer, None, sync_status)
     api_key.change(save_key, api_key, None)
