@@ -740,7 +740,8 @@ def chat(user_msg, display_hist, api_hist, api_key, model, selected_files=""):
         yield "", display_hist, api_hist
         return
 
-    # Prepend selected image references with workflow metadata
+    # Append selected image references with workflow metadata
+    ref_block = ""
     if selected_files and selected_files.strip():
         refs = [f.strip() for f in selected_files.strip().split("\n") if f.strip()]
         if refs:
@@ -762,18 +763,21 @@ def chat(user_msg, display_hist, api_hist, api_key, model, selected_files=""):
                 else:
                     ref_parts.append(f"  file: {fname} (no workflow metadata)")
             ref_block = "\n\n".join(ref_parts)
-            user_msg = f"[Reference images:\n{ref_block}\n]\n\n{user_msg}"
+
+    # Build the full message — user text + reference appendix
+    if ref_block:
+        full_msg = f"{user_msg}\n\n---\n[Reference images:\n{ref_block}\n]"
+    else:
+        full_msg = user_msg
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
-    # Seed api_hist with system prompt if empty.
-    # NOTE: the prompt is chosen per-model at seed time. To switch prompts
-    # when you change models mid-session, hit Clear first.
     if not api_hist:
         api_hist = [{"role": "system", "content": system_prompt_for(model)}]
 
-    api_hist = api_hist + [{"role": "user", "content": user_msg}]
-    display_hist = display_hist + [{"role": "user", "content": user_msg}]
+    api_hist = api_hist + [{"role": "user", "content": full_msg}]
+    # Show the full enriched message in chat so user can verify
+    display_hist = display_hist + [{"role": "user", "content": full_msg}]
     yield "", display_hist, api_hist
 
     for step in range(MAX_STEPS):
