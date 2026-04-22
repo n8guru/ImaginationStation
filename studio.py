@@ -72,7 +72,8 @@ RULES OF ENGAGEMENT:
      tmux new-session -d -s comfyui 'cd /workspace/ComfyUI && source venv/bin/activate && python main.py --listen 0.0.0.0 --port 8188 2>&1 | tee /workspace/comfy.log'
 7. Introspect if unsure: `curl -s http://127.0.0.1:8188/object_info | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d)[:50])"`.
 8. Be terse in chat. Tool output is shown separately — don't re-narrate it.
-9. REVIEW LOOP: After generating an image, call review_image on it. If the verdict is 'fail' or 'flag' (rating < 7), read the prompt deltas, revise your workflow accordingly, and regenerate. Iterate up to 3 times. If it still fails, show the user what you have and ask for guidance."""
+9. REVIEW LOOP: After generating an image, call review_image on it. If the verdict is 'fail' or 'flag' (rating < 7), read the prompt deltas, revise your workflow accordingly, and regenerate. Iterate up to 3 times. If it still fails, show the user what you have and ask for guidance.
+10. REFERENCE IMAGES: When the user's message starts with [Reference images: ...], it contains the FULL workflow that produced those images — prompt, negative prompt, checkpoint, and LoRAs. This is YOUR starting point. You already have everything you need. Do NOT ask the user to repeat any of this. Build your workflow directly from the provided metadata, applying whatever changes the user requests. If the user says "same but change X", use the exact same prompt/checkpoint/loras and only modify X."""
 
 # Grok-specific: stricter template. Grok struggles with open-ended workflow
 # construction, so we hand it an exact skeleton and ask it to substitute.
