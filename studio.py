@@ -1685,49 +1685,85 @@ if __name__ == "__main__":
                 "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}},
             }
 
-        # Submit to ComfyUI
-        try:
-            resp = httpx.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
-            if resp.status_code != 200:
-                return JSONResponse({"error": f"ComfyUI rejected: {resp.text[:500]}"}, status_code=500)
-            prompt_id = resp.json().get("prompt_id")
-        except Exception as e:
-            return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
-
-        # Poll for completion
-        deadline = _time.monotonic() + 300
+        # Generate → review → iterate loop (up to 5 attempts)
+        MAX_ATTEMPTS = 5
+        review = {}
         files = []
-        while _time.monotonic() < deadline:
-            _time.sleep(2)
+        all_attempts = []
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            # Submit to ComfyUI
             try:
-                h = httpx.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
-                if prompt_id in h:
-                    outputs = h[prompt_id].get("outputs", {})
-                    for node_id, node_out in outputs.items():
-                        for img in node_out.get("images", []):
-                            files.append({
-                                "filename": img["filename"],
-                                "subfolder": img.get("subfolder", ""),
-                                "type": img.get("type", "output"),
-                            })
-                    if files:
-                        break
-            except Exception:
-                pass
+                resp = httpx.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
+                if resp.status_code != 200:
+                    return JSONResponse({"error": f"ComfyUI rejected: {resp.text[:500]}"}, status_code=500)
+                prompt_id = resp.json().get("prompt_id")
+            except Exception as e:
+                return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
+
+            # Poll for completion
+            deadline = _time.monotonic() + 300
+            files = []
+            while _time.monotonic() < deadline:
+                _time.sleep(2)
+                try:
+                    h = httpx.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
+                    if prompt_id in h:
+                        outputs = h[prompt_id].get("outputs", {})
+                        for node_id, node_out in outputs.items():
+                            for img in node_out.get("images", []):
+                                files.append({
+                                    "filename": img["filename"],
+                                    "subfolder": img.get("subfolder", ""),
+                                    "type": img.get("type", "output"),
+                                })
+                        if files:
+                            break
+                except Exception:
+                    pass
+
+            if not files:
+                return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
+
+            # Review the generated image
+            img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
+            if img_path.exists():
+                review = t_review_image(
+                    str(img_path),
+                    focus="prompt adherence, anatomy, character count",
+                    reference_paths=ref_local_paths or None,
+                )
+            else:
+                review = {}
+
+            rating = review.get("rating", 0)
+            verdict = review.get("verdict", "unknown")
+            all_attempts.append({
+                "attempt": attempt,
+                "filename": files[0]["filename"] if files else None,
+                "rating": rating,
+                "verdict": verdict,
+            })
+
+            # Pass (rating >= 7) — done
+            if rating >= 7 or verdict == "pass":
+                break
+
+            # Fail — apply prompt deltas and retry with new seed
+            if attempt < MAX_ATTEMPTS:
+                pos_delta = review.get("positive_prompt_delta", "")
+                neg_delta = review.get("negative_prompt_delta", "")
+                if pos_delta:
+                    pos = pos + ", " + pos_delta
+                    workflow["2"]["inputs"]["text"] = pos
+                if neg_delta:
+                    neg = neg + ", " + neg_delta
+                    workflow["3"]["inputs"]["text"] = neg
+                # New seed for next attempt
+                seed = random.randint(1, 9999999)
+                workflow["5"]["inputs"]["seed"] = seed
 
         elapsed = round(_time.monotonic() - t0, 1)
-        if not files:
-            return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
-
-        # Run review on first image — pass reference images for comparison
-        review = {}
-        img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
-        if img_path.exists():
-            review = t_review_image(
-                str(img_path),
-                focus="prompt adherence, anatomy, character count",
-                reference_paths=ref_local_paths or None,
-            )
 
         return JSONResponse({
             "files": files,
@@ -1740,7 +1776,8 @@ if __name__ == "__main__":
             "review_status": review.get("verdict", "unknown"),
             "rating": review.get("rating"),
             "auto_review": review.get("strengths", ""),
-            "total_attempts": 1,
+            "total_attempts": len(all_attempts),
+            "attempts_detail": all_attempts,
         })
 
     @app.get("/api/output/{filename:path}")
