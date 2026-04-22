@@ -1586,67 +1586,72 @@ if __name__ == "__main__":
             del sd
             torch.cuda.empty_cache()
 
-        # Bake in LoRAs
+        # Bake in LoRAs using ComfyUI's own loader (handles key format conversion)
         lora_info = []
-        for l in loras:
-            lora_w = l.get("weight", 0.5)
-            path = str(lora_dir / l["path"])
-            lora_info.append({"lora": l["path"], "weight": lora_w})
+        if loras:
+            import comfy.sd
+            import comfy.utils
 
-            lora_sd = st_torch.load_file(path)
-            # LoRA keys follow pattern: lora_unet_xxx.lora_down/up.weight
-            # Apply: merged_weight += lora_up @ lora_down * scale * weight
-            applied = 0
-            pairs = {}
-            for k in lora_sd:
-                if ".lora_down." in k:
-                    base = k.replace(".lora_down.", ".lora_up.")
-                    if base in lora_sd:
-                        pairs[k] = base
+            for l in loras:
+                lora_w = l.get("weight", 0.5)
+                lora_path = str(lora_dir / l["path"])
+                lora_info.append({"lora": l["path"], "weight": lora_w})
 
-            for down_key, up_key in pairs.items():
-                # Derive the target key in the checkpoint
-                # lora_unet_down_blocks_0_attentions_0_... → model.diffusion_model.down_blocks.0.attentions.0...
-                target_key = down_key.split(".lora_down.")[0]
-                target_key = target_key.replace("lora_unet_", "model.diffusion_model.")
-                target_key = target_key.replace("lora_te_", "conditioner.embedders.0.transformer.")
-                target_key = target_key.replace("lora_te1_", "conditioner.embedders.0.transformer.")
-                target_key = target_key.replace("lora_te2_", "conditioner.embedders.1.transformer.")
-                # Convert underscores back to dots for nested keys
-                # But only between segments, not within layer names
-                parts = target_key.split("_")
-                # Reconstruct with dots where appropriate
-                reconstructed = []
-                i = 0
-                while i < len(parts):
-                    # Numbers stay as-is (block indices)
-                    if parts[i].isdigit() and reconstructed:
-                        reconstructed[-1] += "." + parts[i]
-                    else:
-                        reconstructed.append(parts[i])
-                    i += 1
-                target_key = ".".join(reconstructed) + ".weight"
+                try:
+                    lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
+                    # comfy.sd.load_lora_for_models returns key patches
+                    # We need to apply them directly to the state dict
+                    # Use the lora key converter from comfy
+                    from comfy.lora import model_lora_keys_unet, model_lora_keys_clip
 
-                if target_key in merged:
-                    down = lora_sd[down_key].float()
-                    up = lora_sd[up_key].float()
-                    # LoRA: delta = up @ down * scale
-                    if len(down.shape) == 2 and len(up.shape) == 2:
-                        delta = up @ down * lora_w
-                    elif len(down.shape) == 4:
-                        # Conv layers
-                        delta = torch.nn.functional.conv2d(
-                            down.permute(1, 0, 2, 3), up
-                        ).permute(1, 0, 2, 3) * lora_w
-                    else:
-                        continue
-                    if delta.shape == merged[target_key].shape:
-                        merged[target_key] += delta
-                        applied += 1
+                    # Build mapping from lora keys to model keys
+                    unet_keys = model_lora_keys_unet(None)  # gets the key mapping
+                    applied = 0
 
-            lora_info[-1]["keys_applied"] = applied
-            del lora_sd
-            torch.cuda.empty_cache()
+                    # Pair up/down weights
+                    pairs = {}
+                    for k in lora_sd:
+                        if ".lora_down." in k or ".lora_A." in k:
+                            up_k = k.replace(".lora_down.", ".lora_up.").replace(".lora_A.", ".lora_B.")
+                            if up_k in lora_sd:
+                                pairs[k] = up_k
+
+                    for down_key, up_key in pairs.items():
+                        base_key = down_key.split(".lora_down.")[0].split(".lora_A.")[0]
+
+                        # Try direct mapping via comfy's key tables
+                        target_key = None
+                        for mk, lk in unet_keys.items():
+                            if lk == base_key:
+                                target_key = mk
+                                break
+
+                        if target_key and target_key in merged:
+                            down = lora_sd[down_key].float()
+                            up = lora_sd[up_key].float()
+                            alpha_key = base_key + ".alpha"
+                            alpha = lora_sd.get(alpha_key, torch.tensor(down.shape[0])).float()
+                            scale = alpha / down.shape[0]
+
+                            if len(down.shape) == 2 and len(up.shape) == 2:
+                                delta = (up @ down) * scale * lora_w
+                            elif len(down.shape) == 4 and len(up.shape) == 4:
+                                delta = torch.nn.functional.conv2d(
+                                    down.permute(1, 0, 2, 3), up
+                                ).permute(1, 0, 2, 3) * scale * lora_w
+                            else:
+                                continue
+                            if delta.shape == merged[target_key].shape:
+                                merged[target_key] += delta
+                                applied += 1
+
+                    lora_info[-1]["keys_applied"] = applied
+                    del lora_sd
+                except Exception as e:
+                    lora_info[-1]["error"] = str(e)
+                    lora_info[-1]["keys_applied"] = 0
+
+                torch.cuda.empty_cache()
 
         # Convert back to fp16 for storage efficiency
         for k in merged:
