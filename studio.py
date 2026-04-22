@@ -767,6 +767,42 @@ def _list_outputs():
 def refresh_gallery():
     return _list_outputs()
 
+def _extract_png_meta(path):
+    """Extract prompt, negative, checkpoint, loras from ComfyUI PNG metadata."""
+    try:
+        from PIL import Image
+        img = Image.open(path)
+        raw = img.info.get("prompt", "")
+        if not raw:
+            return None
+        nodes = json.loads(raw)
+        positive = negative = checkpoint = ""
+        loras = []
+        for nid, node in nodes.items():
+            ct = node.get("class_type", "")
+            inp = node.get("inputs", {})
+            if ct == "CLIPTextEncode":
+                txt = inp.get("text", "")
+                # Heuristic: shorter or negative-keyword text is the negative prompt
+                if any(w in txt.lower() for w in ["worst quality", "blurry", "deformed", "ugly"]):
+                    negative = txt
+                elif not positive or len(txt) > len(positive):
+                    positive = txt
+            elif ct == "CheckpointLoaderSimple":
+                checkpoint = inp.get("ckpt_name", "")
+            elif ct == "LoraLoader":
+                ln = inp.get("lora_name", "")
+                sw = inp.get("strength_model", "")
+                if ln:
+                    loras.append(f"{ln} ({sw})")
+        return {"positive": positive, "negative": negative,
+                "checkpoint": checkpoint, "loras": loras}
+    except Exception:
+        return None
+
+# Cache metadata to avoid re-reading PNGs on every 4s refresh
+_meta_cache = {}
+
 def refresh_output_html():
     """Render output strip as HTML cards with selectable thumbnails."""
     files = _list_outputs()
@@ -774,13 +810,41 @@ def refresh_output_html():
         return '<div style="color:#888;text-align:center;padding:40px;">No outputs yet</div>'
     cards = []
     for path, name in files:
+        # Get or cache metadata
+        if path not in _meta_cache:
+            _meta_cache[path] = _extract_png_meta(path)
+        meta = _meta_cache[path]
+
+        details_html = ""
+        if meta:
+            parts = []
+            if meta["positive"]:
+                p = meta["positive"].replace("&", "&amp;").replace("<", "&lt;")
+                parts.append(f"<b>Prompt:</b> {p}")
+            if meta["negative"]:
+                n = meta["negative"].replace("&", "&amp;").replace("<", "&lt;")
+                parts.append(f"<b>Negative:</b> {n}")
+            if meta["checkpoint"]:
+                parts.append(f"<b>Checkpoint:</b> {meta['checkpoint']}")
+            if meta["loras"]:
+                parts.append(f"<b>LoRAs:</b> {', '.join(meta['loras'])}")
+            details_html = f'''<details style="margin-top:2px;" onclick="event.stopPropagation()">
+  <summary style="font-size:10px;color:#666;cursor:pointer;list-style:none;display:flex;align-items:center;gap:3px;">
+    <span style="font-size:7px;">&#9654;</span> workflow</summary>
+  <div style="font-size:10px;color:#999;padding:4px 0 2px;line-height:1.5;user-select:all;">{"<br>".join(parts)}</div>
+</details>'''
+
         cards.append(f'''<div class="out-card" data-path="{name}" onclick="toggleSelect(this)"
-             style="margin-bottom:8px;border:2px solid transparent;border-radius:8px;
+             style="margin-bottom:10px;border:2px solid transparent;border-radius:8px;
                     padding:4px;cursor:pointer;transition:border-color 0.15s;">
   <img src="/gradio_api/file={path}" style="width:100%;border-radius:6px;display:block;"
        onclick="event.stopPropagation();openLightbox(this.src)" loading="lazy">
-  <div style="font-family:monospace;font-size:11px;color:#aaa;padding:4px 2px 0;
-              user-select:all;word-break:break-all;">{name}</div>
+  <div style="display:flex;align-items:center;gap:4px;padding:3px 2px 0;">
+    <input type="checkbox" class="out-check" onclick="event.stopPropagation();toggleSelect(this.closest('.out-card'))"
+           style="margin:0;accent-color:#4a9eff;">
+    <span style="font-family:monospace;font-size:11px;color:#aaa;user-select:all;word-break:break-all;">{name}</span>
+  </div>
+  {details_html}
 </div>''')
     return "\n".join(cards)
 
@@ -788,7 +852,10 @@ OUTPUT_STRIP_JS = """
 <script>
 function toggleSelect(card) {
   card.classList.toggle('selected');
-  card.style.borderColor = card.classList.contains('selected') ? '#4a9eff' : 'transparent';
+  const on = card.classList.contains('selected');
+  card.style.borderColor = on ? '#4a9eff' : 'transparent';
+  const cb = card.querySelector('.out-check');
+  if (cb) cb.checked = on;
   updateSelectedState();
 }
 function updateSelectedState() {
@@ -810,6 +877,8 @@ function clearSelections() {
   document.querySelectorAll('.out-card.selected').forEach(c => {
     c.classList.remove('selected');
     c.style.borderColor = 'transparent';
+    const cb = c.querySelector('.out-check');
+    if (cb) cb.checked = false;
   });
   updateSelectedState();
 }
