@@ -1402,6 +1402,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
                              lines=2, show_label=False)
             with gr.Row():
                 send_btn = gr.Button("Send", variant="primary", scale=3)
+                stop_btn = gr.Button("Stop", variant="stop", scale=1)
                 clear_btn = gr.Button("Clear", scale=1)
 
         # Right: output strip (40%)
@@ -1438,10 +1439,11 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
     output_timer.tick(_refresh_html, None, output_html)
 
     # Wiring
-    send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick, selected_state],
+    _chat_event_1 = send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick, selected_state],
                    [msg, chatbot, api_state]).then(_refresh_html, None, output_html)
-    msg.submit(chat, [msg, chatbot, api_state, api_key, model_pick, selected_state],
+    _chat_event_2 = msg.submit(chat, [msg, chatbot, api_state, api_key, model_pick, selected_state],
                [msg, chatbot, api_state]).then(_refresh_html, None, output_html)
+    stop_btn.click(None, None, None, cancels=[_chat_event_1, _chat_event_2])
     clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
     refresh_btn.click(_refresh_html, None, output_html)
     ref_upload.change(add_reference_images, ref_upload, ref_upload).then(_refresh_html, None, output_html)
