@@ -1568,7 +1568,7 @@ if __name__ == "__main__":
         neg = ("multiple people, duplicate, clone, crowd, extra person, extra face, "
                "extra body, extra limbs, extra arms, extra hands, extra fingers, "
                "bad anatomy, deformed, disfigured, mutation, worst quality, "
-               "low quality, blurry, watermark, text")
+               "low quality, blurry, watermark, text, bad shadows, harsh shadows")
 
         # When reference images are used and prompt suggests nudity,
         # reinforce clothing removal in negative prompt to fight reference bleed
