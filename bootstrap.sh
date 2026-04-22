@@ -38,6 +38,14 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
     else
         warn "Tailscale failed to join — continuing without tailnet (services still accessible via public IP)"
     fi
+
+    # Scrub the auth key once we're joined — it's reusable and must not leak to
+    # subprocess env (the studio LLM has shell access). Unset here + in future
+    # interactive shells. Tmux sessions launched by start_all.sh use `env -u`.
+    unset TS_AUTHKEY
+    if ! grep -q "unset TS_AUTHKEY" /root/.bashrc 2>/dev/null; then
+        echo "unset TS_AUTHKEY  # scrubbed by ImaginationStation/bootstrap.sh" >> /root/.bashrc
+    fi
 fi
 
 # 1. OS packages
@@ -124,10 +132,21 @@ if [ -n "${COMFY_S3_ACCESS_KEY:-}" ] && [ -n "${COMFY_S3_SECRET_KEY:-}" ]; then
     log "syncing models from s3://$BUCKET/models/ ..."
     $S5 sync "s3://${BUCKET}/models/*" models/ || warn "model sync failed (bucket may be empty)"
 
-    # Pull manifest
+    # Pull manifest — or initialize an empty one if Spaces doesn't have it yet.
+    # Either way, /workspace/library/manifest.db must exist so studio.py's
+    # search_library / list_checkpoints return proper results (even if empty)
+    # instead of {"error": "Manifest not available"} — which was pushing the
+    # director to fall back to raw wget.
     mkdir -p /workspace/library
-    $S5 cp "s3://${BUCKET}/library/manifest.db" /workspace/library/manifest.db 2>/dev/null \
-        || warn "no manifest.db on Spaces yet (run ingest.py first)"
+    if ! $S5 cp "s3://${BUCKET}/library/manifest.db" /workspace/library/manifest.db 2>/dev/null; then
+        warn "no manifest.db on Spaces yet — initializing empty one"
+        "$COMFY/venv/bin/python" -c "
+import sys; sys.path.insert(0, '$REPO_DIR')
+from library.manifest import init_db
+init_db().close()
+print('initialized empty manifest.db')
+" || warn "manifest init failed (check boto3/library install)"
+    fi
 
     # Reconcile: log orphan files (in models/ but not in manifest)
     if [ -f /workspace/library/manifest.db ]; then
@@ -177,6 +196,7 @@ log "linking studio files"
 ln -sf "$REPO_DIR/studio.py"      "$WORKSPACE/studio.py"
 ln -sf "$REPO_DIR/rescue.sh"      "$WORKSPACE/rescue.sh"
 ln -sf "$REPO_DIR/start_all.sh"   "$WORKSPACE/start_all.sh"
+ln -sf "$REPO_DIR/CLAUDE.md"      "$WORKSPACE/CLAUDE.md"
 chmod +x "$REPO_DIR/rescue.sh" "$REPO_DIR/start_all.sh" "$REPO_DIR/bootstrap.sh"
 
 # 6. Launch

@@ -50,12 +50,19 @@ Paths:
   - Outputs: /workspace/ComfyUI/output/
   - ComfyUI venv python: /workspace/ComfyUI/venv/bin/python
 
-Installed checkpoints include: juggernaut_x_v10_nsfw.safetensors (SDXL, realistic, uncensored — good default).
-Installed custom nodes: ComfyUI-Manager, ComfyUI-AnimateDiff-Evolved, comfyui_controlnet_aux.
+Model library is backed by DO Spaces (bucket: imagination-video). Every model
+you download gets auto-ingested so the next spawn has it without re-downloading.
+Installed custom nodes: ComfyUI-Manager, ComfyUI-AnimateDiff-Evolved, comfyui_controlnet_aux, ComfyUI_IPAdapter_plus, ComfyUI-Custom-Scripts.
 
 RULES OF ENGAGEMENT:
 1. Execute — don't describe. When the user asks for an image, CALL queue_workflow. Do not print JSON for them to copy.
-2. Use list_models('checkpoints') before generating if unsure what's installed.
+2. MODEL SOURCING — manifest-first, always. Before you ever call install_model:
+   a. search_library(query=...) — find what's already in our backed-up library
+   b. If a match exists: pull_model(filename=...) — fast pull from DO Spaces
+   c. list_models('checkpoints') — confirm what's on local disk already
+   d. Only if nothing matches, call install_model(url, dest_type). It auto-applies
+      HF/Civitai auth and auto-ingests into the manifest on success. Never call
+      run_shell to wget a model yourself — that bypasses the backup pipeline.
 3. Workflows use ComfyUI's API format: a dict of node_id -> {class_type, inputs}. Inputs that come from other nodes use [node_id, output_index].
 3a. EVERY workflow MUST include a terminal output node — typically SaveImage (inputs: images=[vae_decode_id,0], filename_prefix="..."). Without one ComfyUI rejects with "prompt_no_outputs". A minimal SDXL graph needs: CheckpointLoaderSimple → CLIPTextEncode (pos) + CLIPTextEncode (neg) → EmptyLatentImage → KSampler → VAEDecode → SaveImage.
 4. After queue_workflow, call wait_for_image(prompt_id) to block until done, then report the output filename.
@@ -153,20 +160,121 @@ def t_list_models(type="checkpoints"):
             files.append({"name": p.name, "size_gb": round(p.stat().st_size / 1e9, 2)})
     return files
 
+_DEST_TYPE_TO_CATEGORY = {
+    "checkpoints": "checkpoint", "loras": "lora", "vae": "vae",
+    "controlnet": "controlnet", "embeddings": "embedding",
+    "upscalers": "upscaler", "text_encoders": "text_encoder",
+}
+
+_REPO_ROOT = Path(__file__).resolve().parent
+
+def _install_model_preflight(filename):
+    """If filename is in the manifest, return the row. Else None."""
+    conn = _get_manifest_conn()
+    if not conn:
+        return None
+    import sys
+    sys.path.insert(0, str(_REPO_ROOT))
+    from library.manifest import get_by_filename
+    row = get_by_filename(conn, filename)
+    conn.close()
+    return row
+
 def t_install_model(url, dest_type, filename=None):
+    """Install a model. Manifest-first: if filename is already in our library,
+    pull from DO Spaces (fast). Otherwise download from `url` (with HF/Civitai
+    auth), atomic-rename on success, and auto-ingest so the next spawn has it
+    in the library without re-downloading from source."""
     dest_dir = MODELS_DIR / dest_type
     dest_dir.mkdir(parents=True, exist_ok=True)
     if not filename:
         filename = url.rsplit("/", 1)[-1].split("?")[0]
     dest = dest_dir / filename
+
+    if dest.exists() and dest.stat().st_size > 0:
+        return {"status": "already_on_disk", "path": str(dest)}
+
+    # Manifest preflight — route to Spaces pull if we already have this model
+    row = _install_model_preflight(filename)
+    if row and row.get("spaces_key"):
+        return t_pull_model(filename=filename)
+
+    # Not in manifest — download from source with appropriate auth
+    auth_flags = ""
+    hf_tok = os.environ.get("HF_TOKEN", "")
+    civ_tok = os.environ.get("CIVITAI_API_TOKEN", "")
+    if "huggingface.co" in url and hf_tok:
+        auth_flags = "--header=" + shlex.quote("Authorization: Bearer " + hf_tok)
+    elif "civitai.com" in url and civ_tok:
+        sep = "&" if "?" in url else "?"
+        url = url + sep + "token=" + civ_tok
+
+    tmp_dest = dest.with_suffix(dest.suffix + ".part")
+    category = _DEST_TYPE_TO_CATEGORY.get(dest_type, "other")
     tmux_name = f"dl_{int(time.time())}"
-    cmd = f"wget --progress=dot:giga -O {shlex.quote(str(dest))} {shlex.quote(url)} 2>&1 | tee /tmp/{tmux_name}.log"
-    subprocess.Popen(["tmux", "new-session", "-d", "-s", tmux_name, cmd])
+    log_path = f"/tmp/{tmux_name}.log"
+    py = "/workspace/ComfyUI/venv/bin/python"
+
+    # Download → atomic rename → ingest (upload to Spaces + add manifest row)
+    # On any failure, clean up the .part file so we don't leave a stub.
+    cmd = (
+        f"set -e; "
+        f"wget --progress=dot:giga {auth_flags} -O {shlex.quote(str(tmp_dest))} {shlex.quote(url)} "
+        f"&& mv {shlex.quote(str(tmp_dest))} {shlex.quote(str(dest))} "
+        f"&& cd {shlex.quote(str(_REPO_ROOT))} "
+        f"&& {py} ingest.py local {shlex.quote(str(dest))} --category {category} "
+        f"|| {{ echo INSTALL_FAILED; rm -f {shlex.quote(str(tmp_dest))}; exit 1; }}"
+    )
+    full_cmd = f"({cmd}) 2>&1 | tee {log_path}"
+    subprocess.Popen(["tmux", "new-session", "-d", "-s", tmux_name, full_cmd])
     return {
         "status": "download_started",
         "tmux_session": tmux_name,
         "dest": str(dest),
-        "check_progress": f"run_shell: tail -5 /tmp/{tmux_name}.log",
+        "auto_ingest": True,
+        "check_progress": f"run_shell: tail -20 {log_path}",
+        "done_when": "log ends with a success line from ingest.py (look for 'Manifest pushed to Spaces' or 'Done:')",
+    }
+
+def t_pull_model(filename):
+    """Pull a model from DO Spaces by filename. Model must be in the manifest.
+    Returns quickly — the s5cmd transfer runs in a tmux session."""
+    row = _install_model_preflight(filename)
+    if not row:
+        return {"error": f"'{filename}' not in manifest. Use install_model(url, dest_type) to fetch from source."}
+    spaces_key = row["spaces_key"]
+    # spaces_key like "models/checkpoints/foo.safetensors" — strip "models/" for local path
+    rel = spaces_key[len("models/"):] if spaces_key.startswith("models/") else spaces_key
+    dest = MODELS_DIR / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and dest.stat().st_size > 0:
+        return {"status": "already_on_disk", "path": str(dest),
+                "display_name": row["display_name"], "trigger_words": row["trigger_words"]}
+    bucket = os.environ.get("COMFY_S3_BUCKET", "imagination-video")
+    endpoint = os.environ.get("COMFY_S3_ENDPOINT", "https://sfo3.digitaloceanspaces.com")
+    access = os.environ.get("COMFY_S3_ACCESS_KEY", "")
+    secret = os.environ.get("COMFY_S3_SECRET_KEY", "")
+    if not (access and secret):
+        return {"error": "S3 credentials not available in env."}
+    tmux_name = f"dl_{int(time.time())}"
+    log_path = f"/tmp/{tmux_name}.log"
+    tmp_dest = dest.with_suffix(dest.suffix + ".part")
+    cmd = (
+        f"AWS_ACCESS_KEY_ID={shlex.quote(access)} AWS_SECRET_ACCESS_KEY={shlex.quote(secret)} "
+        f"s5cmd --endpoint-url {shlex.quote(endpoint)} cp "
+        f"{shlex.quote(f's3://{bucket}/{spaces_key}')} {shlex.quote(str(tmp_dest))} "
+        f"&& mv {shlex.quote(str(tmp_dest))} {shlex.quote(str(dest))} "
+        f"|| {{ echo PULL_FAILED; rm -f {shlex.quote(str(tmp_dest))}; exit 1; }}"
+    )
+    full_cmd = f"({cmd}) 2>&1 | tee {log_path}"
+    subprocess.Popen(["tmux", "new-session", "-d", "-s", tmux_name, full_cmd])
+    return {
+        "status": "pull_started",
+        "tmux_session": tmux_name,
+        "dest": str(dest),
+        "display_name": row["display_name"],
+        "trigger_words": row["trigger_words"],
+        "check_progress": f"run_shell: tail -5 {log_path}",
     }
 
 def t_list_custom_nodes():
@@ -239,7 +347,7 @@ def t_search_library(query="", base_model="", category=""):
     if not conn:
         return {"error": "Manifest not available. Run model sync or ingest first."}
     import sys
-    sys.path.insert(0, str(Path(__file__).parent))
+    sys.path.insert(0, str(_REPO_ROOT))
     from library.manifest import search
     results = search(conn, query, base_model=base_model or None, category=category or None)
     conn.close()
@@ -262,7 +370,7 @@ def t_get_lora_details(filename=""):
     if not conn:
         return {"error": "Manifest not available."}
     import sys
-    sys.path.insert(0, str(Path(__file__).parent))
+    sys.path.insert(0, str(_REPO_ROOT))
     from library.manifest import get_by_filename
     result = get_by_filename(conn, filename)
     conn.close()
@@ -276,7 +384,7 @@ def t_list_checkpoints(base_model=""):
     if not conn:
         return {"error": "Manifest not available."}
     import sys
-    sys.path.insert(0, str(Path(__file__).parent))
+    sys.path.insert(0, str(_REPO_ROOT))
     from library.manifest import list_checkpoints
     results = list_checkpoints(conn, base_model=base_model or None)
     conn.close()
@@ -392,6 +500,7 @@ TOOL_FNS = {
     "wait_for_image": t_wait_for_image,
     "list_models": t_list_models,
     "install_model": t_install_model,
+    "pull_model": t_pull_model,
     "list_custom_nodes": t_list_custom_nodes,
     "install_custom_node": t_install_custom_node,
     "gpu_status": t_gpu_status,
@@ -437,12 +546,19 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "install_model",
-        "description": "Start a wget download of a model into models/<dest_type>/<filename>. Returns immediately; check progress via run_shell.",
+        "description": "Download a model from an external URL (HuggingFace / CivitAI / etc.). Manifest-first: if the filename is already in our library manifest, this routes to pull_model (fast Spaces pull) instead. On fresh download, auth is auto-applied (HF_TOKEN / CIVITAI_API_TOKEN) and the file is auto-ingested into the manifest + backed up to Spaces, so next spawn has it available. Returns immediately; check progress via run_shell.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "dest_type": {"type": "string", "description": "e.g. checkpoints, loras, controlnet, vae, text_encoders"},
             "filename": {"type": "string", "description": "Override filename (default: infer from URL)"}
         }, "required": ["url", "dest_type"]}
+    }},
+    {"type": "function", "function": {
+        "name": "pull_model",
+        "description": "Pull a model from our DO Spaces backup by filename. The model MUST already be in the manifest (use search_library first). This is the fast path — prefer it over install_model when the library already has what you need.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "Exact filename as stored in the manifest"}
+        }, "required": ["filename"]}
     }},
     {"type": "function", "function": {
         "name": "list_custom_nodes",
