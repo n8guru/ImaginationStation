@@ -1537,7 +1537,7 @@ if __name__ == "__main__":
             if single:
                 ref_images_raw = [single]
         ref_image_data = data.get("reference_image_data", "")
-        ref_weight = float(data.get("reference_weight", 0.5))
+        ref_weight = float(data.get("reference_weight", 0.3))
 
         if not description:
             return JSONResponse({"error": "description is required"}, status_code=400)
@@ -1636,11 +1636,11 @@ if __name__ == "__main__":
                 workflow[load_id] = {"class_type": "LoadImage", "inputs": {"image": ref_name}}
                 workflow[ipa_id] = {"class_type": "IPAdapterAdvanced", "inputs": {
                     "weight": round(w, 2),
-                    "weight_type": "linear",
+                    "weight_type": "style transfer",
                     "combine_embeds": "concat",
                     "embeds_scaling": "V only",
-                    "start_at": 0.15,
-                    "end_at": 0.85,
+                    "start_at": 0.2,
+                    "end_at": 0.8,
                     "model": [prev_model, 0],
                     "ipadapter": ["13", 0],
                     "image": [load_id, 0],
