@@ -2378,6 +2378,7 @@ RULES:
         review = {}
         files = []
         all_attempts = []
+        prompt_chain = [{"step": "initial", "source": prompt_source, "positive": pos, "negative": neg}]
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             # Submit to ComfyUI
@@ -2431,6 +2432,11 @@ RULES:
                 "filename": files[0]["filename"] if files else None,
                 "rating": rating,
                 "verdict": verdict,
+                "positive": pos,
+                "negative": neg,
+                "review": {k: review.get(k, "") for k in
+                           ["strengths", "weaknesses", "anatomy_issues",
+                            "reference_match", "recommendation"]},
             })
 
             # Pass (rating >= 7) — save recipe and done
@@ -2453,6 +2459,13 @@ RULES:
                     review_feedback=review_feedback,
                     previous_pos=pos, previous_neg=neg,
                 )
+                prompt_chain.append({
+                    "step": f"revision_{attempt}",
+                    "source": "optimizer (review feedback)",
+                    "positive": pos,
+                    "negative": neg,
+                    "triggered_by": f"rating {rating}/10",
+                })
                 workflow["2"]["inputs"]["text"] = pos
                 workflow["3"]["inputs"]["text"] = neg
                 # New seed for next attempt
@@ -2476,6 +2489,8 @@ RULES:
             "auto_review": review.get("strengths", ""),
             "total_attempts": len(all_attempts),
             "attempts_detail": all_attempts,
+            "prompt_chain": prompt_chain,
+            "reference_images_used": [Path(r).name for r in ref_local_paths] if ref_local_paths else [],
         })
 
     @app.get("/api/output/{filename:path}")
