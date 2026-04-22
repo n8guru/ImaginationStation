@@ -1560,15 +1560,28 @@ if __name__ == "__main__":
 
         seed = random.randint(1, 9999999)
 
-        # Apply prompt engineering rules
+        # Apply prompt engineering rules — only add solo tag if prompt doesn't
+        # already indicate character count (multi-person scenes must not get "1girl, solo")
         pos = description
-        if not any(tag in pos.lower() for tag in ["1girl", "1boy", "1woman", "1man", "solo", "2people", "couple"]):
+        multi_hints = ["2people", "couple", "threesome", "group", "three", "two",
+                       "both", "together", "multiple", "3people", "2girls", "2boys",
+                       "three-person", "two-person"]
+        single_tags = ["1girl", "1boy", "1woman", "1man", "solo"]
+        has_count = any(tag in pos.lower() for tag in single_tags + multi_hints)
+        if not has_count:
             pos = "1girl, solo, " + pos
 
-        neg = ("multiple people, duplicate, clone, crowd, extra person, extra face, "
-               "extra body, extra limbs, extra arms, extra hands, extra fingers, "
-               "bad anatomy, deformed, disfigured, mutation, worst quality, "
-               "low quality, blurry, watermark, text, bad shadows, harsh shadows")
+        is_multi = any(h in pos.lower() for h in multi_hints)
+        if is_multi:
+            neg = ("duplicate, clone, crowd, extra limbs, extra arms, extra hands, "
+                   "extra fingers, bad anatomy, deformed, disfigured, mutation, "
+                   "worst quality, low quality, blurry, watermark, text, "
+                   "bad shadows, harsh shadows")
+        else:
+            neg = ("multiple people, duplicate, clone, crowd, extra person, extra face, "
+                   "extra body, extra limbs, extra arms, extra hands, extra fingers, "
+                   "bad anatomy, deformed, disfigured, mutation, worst quality, "
+                   "low quality, blurry, watermark, text, bad shadows, harsh shadows")
 
         # When reference images are used and prompt suggests nudity,
         # reinforce clothing removal in negative prompt to fight reference bleed
