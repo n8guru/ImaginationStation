@@ -1510,7 +1510,7 @@ if __name__ == "__main__":
             "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
             "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
             "5": {"class_type": "KSampler", "inputs": {
-                "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_a",
+                "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
                 "scheduler": "normal", "denoise": 1,
                 "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]
             }},
