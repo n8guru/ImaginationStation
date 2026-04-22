@@ -648,11 +648,20 @@ def t_load_workflow(path):
         )
 
     else:
-        # API format — direct summary
+        # API format — may be wrapped in {name, notes, workflow} or bare node dict
+        raw_wf = data
+        if isinstance(data, dict) and "workflow" in data:
+            raw_wf = data["workflow"]
+            summary["name"] = data.get("name", "")
+            summary["notes"] = data.get("notes", "")
+
         summary["format"] = "api"
-        summary["total_nodes"] = len(data) if isinstance(data, dict) else "?"
-        if isinstance(data, dict):
-            for nid, node in data.items():
+        summary["total_nodes"] = len(raw_wf) if isinstance(raw_wf, dict) else "?"
+        summary["full_workflow"] = raw_wf  # include so director can queue_workflow directly
+        if isinstance(raw_wf, dict):
+            for nid, node in raw_wf.items():
+                if not isinstance(node, dict):
+                    continue
                 ct = node.get("class_type", "")
                 inp = node.get("inputs", {})
                 if ct == "CLIPTextEncode" and inp.get("text"):
@@ -666,7 +675,6 @@ def t_load_workflow(path):
                         summary["resolution"] = f"{inp.get('width')}x{inp.get('height')}"
                 elif "KSampler" in ct:
                     summary["sampler"] = {k: inp[k] for k in ["steps", "cfg", "sampler_name", "scheduler", "denoise"] if k in inp}
-        summary["full_workflow"] = data
 
     return summary
 
