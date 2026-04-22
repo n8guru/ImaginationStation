@@ -1515,6 +1515,294 @@ if __name__ == "__main__":
             return JSONResponse({"status": "deleted"})
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    # ---- Calibration helpers ----
+
+    CALIBRATION_DIR = OUTPUT_DIR / "calibration_profiles"
+
+    def _build_ipa_workflow(ckpt, pos, neg, ref_names, seed,
+                            weight=0.3, weight_type="linear",
+                            start_at=0.2, end_at=0.8,
+                            embeds_scaling="V only",
+                            filename_prefix="cal"):
+        """Build an IPAdapter workflow with explicit parameters."""
+        workflow = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
+            "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "11": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"}},
+            "13": {"class_type": "IPAdapterModelLoader", "inputs": {
+                "ipadapter_file": "ip-adapter-plus_sdxl_vit-h.safetensors"
+            }},
+        }
+        prev_model = "1"
+        n = len(ref_names)
+        for i, ref_name in enumerate(ref_names):
+            load_id = str(20 + i * 2)
+            ipa_id = str(21 + i * 2)
+            w = weight if n == 1 else weight / n
+            workflow[load_id] = {"class_type": "LoadImage", "inputs": {"image": ref_name}}
+            workflow[ipa_id] = {"class_type": "IPAdapterAdvanced", "inputs": {
+                "weight": round(w, 2),
+                "weight_type": weight_type,
+                "combine_embeds": "concat",
+                "embeds_scaling": embeds_scaling,
+                "start_at": start_at,
+                "end_at": end_at,
+                "model": [prev_model, 0],
+                "ipadapter": ["13", 0],
+                "image": [load_id, 0],
+                "clip_vision": ["11", 0],
+            }}
+            prev_model = ipa_id
+        workflow["5"] = {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
+            "scheduler": "normal", "denoise": 1,
+            "model": [prev_model, 0], "positive": ["2", 0], "negative": ["3", 0],
+            "latent_image": ["4", 0]
+        }}
+        workflow["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}}
+        workflow["7"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}}
+        return workflow
+
+    def _submit_and_wait(workflow, timeout=300):
+        """Submit a workflow to ComfyUI and wait for output files."""
+        import httpx, time as _t
+        try:
+            resp = httpx.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
+            if resp.status_code != 200:
+                return None, f"ComfyUI rejected: {resp.text[:200]}"
+            prompt_id = resp.json().get("prompt_id")
+        except Exception as e:
+            return None, str(e)
+
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            _t.sleep(2)
+            try:
+                h = httpx.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
+                if prompt_id in h:
+                    files = []
+                    for node_out in h[prompt_id].get("outputs", {}).values():
+                        for img in node_out.get("images", []):
+                            files.append(img["filename"])
+                    if files:
+                        return files, None
+            except Exception:
+                pass
+        return None, "timeout"
+
+    def _load_calibration_profile(ref_names, ckpt):
+        """Load a calibration profile matching these reference images + checkpoint."""
+        CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+        # Hash ref names for lookup
+        key = hashlib.md5((",".join(sorted(ref_names)) + "|" + ckpt).encode()).hexdigest()[:12]
+        profile_path = CALIBRATION_DIR / f"cal_{key}.json"
+        if profile_path.exists():
+            try:
+                return json.loads(profile_path.read_text())
+            except Exception:
+                pass
+        return None
+
+    @app.post("/api/calibrate")
+    async def api_calibrate(request: Request):
+        """Run a structured IPAdapter parameter sweep to find optimal settings.
+
+        Tests weight, window, weight_type, and embeds_scaling in sequence,
+        picking the best from each phase before moving to the next.
+        Returns a calibration profile with optimal settings.
+        """
+        import hashlib, random, time as _time
+        data = await request.json()
+        description = (data.get("description") or "").strip()
+        ref_images_raw = data.get("reference_images", [])
+        ref_image_data = data.get("reference_image_data", "")
+        profile_name = data.get("profile_name", "")
+
+        if not description:
+            return JSONResponse({"error": "description required"}, status_code=400)
+        if not ref_images_raw and not ref_image_data:
+            return JSONResponse({"error": "reference images required for calibration"}, status_code=400)
+
+        t0 = _time.monotonic()
+
+        # Find checkpoint
+        ckpt = "bigLove_ultra5.safetensors"
+        ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
+        if ckpt_dir.exists():
+            available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
+            for pref in ["bigLove", "sdxl", "analXL", "dreamshaper"]:
+                match = [a for a in available if pref.lower() in a.lower()]
+                if match:
+                    ckpt = match[0]
+                    break
+
+        # Resolve reference images
+        import httpx
+        ref_local_paths = []
+        for i, ref in enumerate(ref_images_raw):
+            if not ref:
+                continue
+            if ref.startswith("http"):
+                try:
+                    dl = httpx.get(ref, timeout=30, follow_redirects=True)
+                    dl.raise_for_status()
+                    local = str(OUTPUT_DIR / f"_calref_{i}.png")
+                    Path(local).write_bytes(dl.content)
+                    ref_local_paths.append(local)
+                except Exception:
+                    pass
+            elif Path(ref).exists():
+                ref_local_paths.append(ref)
+            elif (OUTPUT_DIR / ref).exists():
+                ref_local_paths.append(str(OUTPUT_DIR / ref))
+
+        if ref_image_data:
+            import base64
+            try:
+                img_bytes = base64.b64decode(ref_image_data)
+                local = str(OUTPUT_DIR / "_calref_b64.png")
+                Path(local).write_bytes(img_bytes)
+                ref_local_paths.append(local)
+            except Exception:
+                pass
+
+        if not ref_local_paths:
+            return JSONResponse({"error": "No valid reference images"}, status_code=400)
+
+        # Copy refs to ComfyUI input
+        import shutil
+        input_dir = COMFY_ROOT / "input"
+        input_dir.mkdir(exist_ok=True)
+        ref_names = []
+        for rp in ref_local_paths:
+            name = Path(rp).name
+            shutil.copy2(rp, str(input_dir / name))
+            ref_names.append(name)
+
+        # Optimize prompt
+        has_refs = True
+        pos, neg = _optimize_prompt(description, ckpt, has_refs)
+
+        # Fixed seed for comparability
+        seed = random.randint(1, 9999999)
+        results = {}
+
+        def _run_test(label, **ipa_params):
+            """Generate one image with given params, review it, return score."""
+            wf = _build_ipa_workflow(
+                ckpt, pos, neg, ref_names, seed,
+                filename_prefix=f"cal_{label}",
+                **ipa_params,
+            )
+            files, err = _submit_and_wait(wf, timeout=120)
+            if err or not files:
+                return {"label": label, "rating": 0, "error": err, "params": ipa_params}
+            img_path = OUTPUT_DIR / files[0]
+            review = {}
+            if img_path.exists():
+                review = t_review_image(
+                    str(img_path),
+                    focus="pose accuracy, face consistency, prompt adherence, clothing vs nudity",
+                    reference_paths=ref_local_paths,
+                )
+            return {
+                "label": label,
+                "filename": files[0],
+                "rating": review.get("rating", 0),
+                "verdict": review.get("verdict", "unknown"),
+                "strengths": review.get("strengths", ""),
+                "weaknesses": review.get("weaknesses", ""),
+                "reference_match": review.get("reference_match", ""),
+                "params": ipa_params,
+            }
+
+        # --- Phase 1: Weight sweep ---
+        weight_tests = [0.2, 0.4, 0.6, 0.8, 1.0]
+        phase1 = []
+        for w in weight_tests:
+            r = _run_test(f"w{int(w*10)}", weight=w, weight_type="linear",
+                          start_at=0.0, end_at=1.0, embeds_scaling="V only")
+            phase1.append(r)
+        results["weight_sweep"] = phase1
+        best_weight = max(phase1, key=lambda x: x["rating"])["params"]["weight"]
+
+        # --- Phase 2: Window sweep ---
+        window_tests = [(0.0, 1.0), (0.1, 0.9), (0.2, 0.8), (0.3, 0.7)]
+        phase2 = []
+        for sa, ea in window_tests:
+            r = _run_test(f"win{int(sa*10)}{int(ea*10)}", weight=best_weight,
+                          weight_type="linear", start_at=sa, end_at=ea,
+                          embeds_scaling="V only")
+            phase2.append(r)
+        results["window_sweep"] = phase2
+        best_window = max(phase2, key=lambda x: x["rating"])["params"]
+        best_start = best_window["start_at"]
+        best_end = best_window["end_at"]
+
+        # --- Phase 3: Weight type sweep ---
+        type_tests = ["linear", "ease in-out", "strong style transfer", "style and composition"]
+        phase3 = []
+        for wt in type_tests:
+            r = _run_test(f"type_{wt.replace(' ','_')[:10]}", weight=best_weight,
+                          weight_type=wt, start_at=best_start, end_at=best_end,
+                          embeds_scaling="V only")
+            phase3.append(r)
+        results["type_sweep"] = phase3
+        best_type = max(phase3, key=lambda x: x["rating"])["params"]["weight_type"]
+
+        # --- Phase 4: Embeds scaling sweep ---
+        scaling_tests = ["V only", "K+V", "K+mean(V) w/ C penalty"]
+        phase4 = []
+        for es in scaling_tests:
+            r = _run_test(f"emb_{es.replace(' ','_')[:8]}", weight=best_weight,
+                          weight_type=best_type, start_at=best_start, end_at=best_end,
+                          embeds_scaling=es)
+            phase4.append(r)
+        results["scaling_sweep"] = phase4
+        best_scaling = max(phase4, key=lambda x: x["rating"])["params"]["embeds_scaling"]
+
+        # Build optimal profile
+        optimal = {
+            "weight": best_weight,
+            "weight_type": best_type,
+            "start_at": best_start,
+            "end_at": best_end,
+            "embeds_scaling": best_scaling,
+        }
+
+        # Save profile
+        CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
+        key = hashlib.md5((",".join(sorted(ref_names)) + "|" + ckpt).encode()).hexdigest()[:12]
+        from datetime import datetime, timezone
+        profile = {
+            "profile_id": profile_name or f"cal_{key}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "reference_images": ref_names,
+            "test_prompt": description,
+            "checkpoint": ckpt,
+            "results": results,
+            "optimal": optimal,
+        }
+        profile_path = CALIBRATION_DIR / f"cal_{key}.json"
+        profile_path.write_text(json.dumps(profile, indent=2))
+
+        elapsed = round(_time.monotonic() - t0, 1)
+
+        return JSONResponse({
+            "profile_id": profile["profile_id"],
+            "optimal": optimal,
+            "elapsed_s": elapsed,
+            "total_tests": len(phase1) + len(phase2) + len(phase3) + len(phase4),
+            "results_summary": {
+                "weight_sweep": [{"weight": r["params"]["weight"], "rating": r["rating"]} for r in phase1],
+                "window_sweep": [{"start_at": r["params"]["start_at"], "end_at": r["params"]["end_at"], "rating": r["rating"]} for r in phase2],
+                "type_sweep": [{"weight_type": r["params"]["weight_type"], "rating": r["rating"]} for r in phase3],
+                "scaling_sweep": [{"embeds_scaling": r["params"]["embeds_scaling"], "rating": r["rating"]} for r in phase4],
+            },
+        })
+
     def _optimize_prompt(description, checkpoint, has_references,
                          review_feedback=None, previous_pos=None, previous_neg=None):
         """Use a fast LLM to convert a natural-language description into
@@ -1663,62 +1951,42 @@ RULES:
                 pass
 
         # Build workflow — IPAdapter if reference images, plain txt2img otherwise
+        calibration_profile = None
         if ref_local_paths:
-            import shutil
+            import shutil, hashlib
             input_dir = COMFY_ROOT / "input"
             input_dir.mkdir(exist_ok=True)
 
-            # Copy all ref images to ComfyUI input dir
             ref_names = []
             for rp in ref_local_paths:
                 name = Path(rp).name
                 shutil.copy2(rp, str(input_dir / name))
                 ref_names.append(name)
 
-            # Base workflow with IPAdapter
-            workflow = {
-                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
-                "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
-                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
-                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
-                "11": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"}},
-                "13": {"class_type": "IPAdapterModelLoader", "inputs": {
-                    "ipadapter_file": "ip-adapter-plus_sdxl_vit-h.safetensors"
-                }},
-            }
+            # Load calibration profile if one exists for these refs
+            cal = _load_calibration_profile(ref_names, ckpt)
+            if cal:
+                opt = cal.get("optimal", {})
+                calibration_profile = cal.get("profile_id")
+                ipa_weight = opt.get("weight", ref_weight)
+                ipa_type = opt.get("weight_type", "linear")
+                ipa_start = opt.get("start_at", 0.2)
+                ipa_end = opt.get("end_at", 0.8)
+                ipa_scaling = opt.get("embeds_scaling", "V only")
+            else:
+                ipa_weight = ref_weight
+                ipa_type = "linear"
+                ipa_start = 0.2
+                ipa_end = 0.8
+                ipa_scaling = "V only"
 
-            # Chain IPAdapter nodes — each reference image adds conditioning
-            prev_model = "1"  # start from checkpoint output
-            for i, ref_name in enumerate(ref_names):
-                load_id = str(20 + i * 2)
-                ipa_id = str(21 + i * 2)
-                # Per-image weight: distribute evenly, or full weight for single
-                w = ref_weight if len(ref_names) == 1 else ref_weight / len(ref_names)
-
-                workflow[load_id] = {"class_type": "LoadImage", "inputs": {"image": ref_name}}
-                workflow[ipa_id] = {"class_type": "IPAdapterAdvanced", "inputs": {
-                    "weight": round(w, 2),
-                    "weight_type": "linear",
-                    "combine_embeds": "concat",
-                    "embeds_scaling": "V only",
-                    "start_at": 0.2,
-                    "end_at": 0.8,
-                    "model": [prev_model, 0],
-                    "ipadapter": ["13", 0],
-                    "image": [load_id, 0],
-                    "clip_vision": ["11", 0],
-                }}
-                prev_model = ipa_id
-
-            # KSampler uses the last IPAdapter output as model
-            workflow["5"] = {"class_type": "KSampler", "inputs": {
-                "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
-                "scheduler": "normal", "denoise": 1,
-                "model": [prev_model, 0], "positive": ["2", 0], "negative": ["3", 0],
-                "latent_image": ["4", 0]
-            }}
-            workflow["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}}
-            workflow["7"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}}
+            workflow = _build_ipa_workflow(
+                ckpt, pos, neg, ref_names, seed,
+                weight=ipa_weight, weight_type=ipa_type,
+                start_at=ipa_start, end_at=ipa_end,
+                embeds_scaling=ipa_scaling,
+                filename_prefix=filename_prefix,
+            )
         else:
             # Plain text-to-image
             workflow = {
@@ -1830,6 +2098,7 @@ RULES:
             "has_reference": bool(ref_local_paths),
             "reference_count": len(ref_local_paths),
             "reference_weight": ref_weight if ref_local_paths else None,
+            "calibration_profile": calibration_profile,
             "elapsed_s": elapsed,
             "review_status": review.get("verdict", "unknown"),
             "rating": review.get("rating"),
