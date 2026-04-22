@@ -1027,14 +1027,13 @@ function openLightbox(src) {
   document.body.appendChild(overlay);
 }
 function deleteFile(name) {
-  if (!confirm('Delete ' + name + '?')) return;
+  const card = document.querySelector('.out-card[data-path="' + name + '"]');
+  if (card) { card.style.opacity = '0.3'; card.style.pointerEvents = 'none'; }
   fetch('/api/delete_output', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({name: name})
-  });
-  // Remove card from DOM immediately
-  const card = document.querySelector('.out-card[data-path="' + name + '"]');
-  if (card) card.remove();
+  }).then(r => { if (card) card.remove(); })
+    .catch(() => { if (card) { card.style.opacity = '1'; card.style.pointerEvents = ''; } });
 }
 function clearSelections() {
   document.querySelectorAll('.out-card.selected').forEach(c => {
@@ -1165,12 +1164,12 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
             with gr.Row():
                 gr.Markdown("### Outputs")
                 deselect_btn = gr.Button("Clear selection", size="sm", scale=0, min_width=100)
+            ref_upload = gr.File(label="Add reference images", file_count="multiple",
+                                 file_types=["image"], height=60)
             output_html = gr.HTML(value=refresh_output_html() + OUTPUT_STRIP_JS,
                                   elem_id="output-html")
             selected_state = gr.Textbox(value="", visible=False, elem_id="selected-files-state")
             delete_trigger = gr.Textbox(value="", visible=False, elem_id="delete-trigger")
-            ref_upload = gr.File(label="Add reference images", file_count="multiple",
-                                 file_types=["image"], height=60)
             with gr.Row():
                 refresh_btn = gr.Button("↻ Refresh", size="sm", scale=1)
                 sync_btn = gr.Button("💾 N8Razer", size="sm", scale=1,
