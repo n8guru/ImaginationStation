@@ -805,7 +805,7 @@ CSS = """
 footer {display:none !important}
 .gradio-container {max-width: 100% !important; padding: 8px !important;}
 .gradio-container > .main, .gradio-container .contain {max-width: 100% !important; padding: 0 !important;}
-.chatbot {height: calc(100vh - 200px) !important;}
+.chatbot {height: calc(100vh - 320px) !important;}
 #comfyframe iframe {width: 100%; height: 800px; border: 1px solid #444; border-radius: 8px;}
 #output-strip {overflow-y: auto; max-height: calc(100vh - 120px);}
 #output-strip .gallery-item {margin-bottom: 4px;}
@@ -841,9 +841,9 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
         with gr.Column(scale=2, min_width=300, elem_id="output-strip"):
             gr.Markdown("### Outputs")
             gallery = gr.Gallery(value=refresh_gallery(), columns=2,
-                                 height="calc(100vh - 220px)",
-                                 show_label=False, allow_preview=True,
-                                 object_fit="contain")
+                                 height="calc(100vh - 240px)",
+                                 show_label=False, allow_preview=False,
+                                 object_fit="contain", show_caption=True)
             with gr.Row():
                 refresh_btn = gr.Button("↻ Refresh", size="sm", scale=1)
                 sync_btn = gr.Button("💾 N8Razer", size="sm", scale=1,
