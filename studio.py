@@ -843,7 +843,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
             gallery = gr.Gallery(value=refresh_gallery(), columns=2,
                                  height="calc(100vh - 240px)",
                                  show_label=False, allow_preview=False,
-                                 object_fit="contain", show_caption=True)
+                                 object_fit="contain")
             with gr.Row():
                 refresh_btn = gr.Button("↻ Refresh", size="sm", scale=1)
                 sync_btn = gr.Button("💾 N8Razer", size="sm", scale=1,
