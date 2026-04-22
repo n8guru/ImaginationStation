@@ -650,12 +650,29 @@ def chat(user_msg, display_hist, api_hist, api_key, model, selected_files=""):
         yield "", display_hist, api_hist
         return
 
-    # Prepend selected image references so the director knows what user is pointing at
+    # Prepend selected image references with workflow metadata
     if selected_files and selected_files.strip():
         refs = [f.strip() for f in selected_files.strip().split("\n") if f.strip()]
         if refs:
-            ref_text = "  ".join(refs)
-            user_msg = f"[Reference images: {ref_text}]\n\n{user_msg}"
+            ref_parts = []
+            for fname in refs:
+                fpath = OUTPUT_DIR / fname
+                meta = _extract_png_meta(str(fpath)) if fpath.exists() else None
+                if meta:
+                    parts = [f"  file: {fname}"]
+                    if meta["positive"]:
+                        parts.append(f"  prompt: {meta['positive']}")
+                    if meta["negative"]:
+                        parts.append(f"  negative: {meta['negative']}")
+                    if meta["checkpoint"]:
+                        parts.append(f"  checkpoint: {meta['checkpoint']}")
+                    if meta["loras"]:
+                        parts.append(f"  loras: {', '.join(meta['loras'])}")
+                    ref_parts.append("\n".join(parts))
+                else:
+                    ref_parts.append(f"  file: {fname} (no workflow metadata)")
+            ref_block = "\n\n".join(ref_parts)
+            user_msg = f"[Reference images:\n{ref_block}\n]\n\n{user_msg}"
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
