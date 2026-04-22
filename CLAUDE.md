@@ -47,6 +47,11 @@ pulled from Spaces on boot and pushed back after every ingest.
 **Current library**: ~52 models (15 checkpoints, 36 LoRAs, 2 VAEs, 1 upscaler).
 Includes NSFW models from CivitAI. Use `search_library` in the studio to browse.
 
+**On-demand pull**: Models are NOT synced at boot — only the manifest is pulled.
+The director uses `search_library` to find models, then `pull_model(filename)`
+to download just the ones needed for the current session. This keeps boot fast
+and avoids pulling 90+ GB when only a few models are needed.
+
 **Concurrency**: V1 is single-writer. Do NOT run `ingest.py` from two boxes
 simultaneously — the SQLite manifest is synced whole and concurrent writes clobber.
 
