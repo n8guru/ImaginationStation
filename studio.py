@@ -1838,7 +1838,7 @@ if __name__ == "__main__":
         ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
         if ckpt_dir.exists():
             available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
-            for pref in ["bigLove", "sdxl", "analXL", "dreamshaper"]:
+            for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
                 match = [a for a in available if pref.lower() in a.lower()]
                 if match:
                     ckpt = match[0]
@@ -2113,7 +2113,7 @@ RULES:
         ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
         if ckpt_dir.exists():
             available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
-            for pref in ["bigLove", "sdxl", "analXL", "dreamshaper"]:
+            for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
                 match = [a for a in available if pref.lower() in a.lower()]
                 if match:
                     ckpt = match[0]
