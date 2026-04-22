@@ -73,7 +73,42 @@ RULES OF ENGAGEMENT:
 7. Introspect if unsure: `curl -s http://127.0.0.1:8188/object_info | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d)[:50])"`.
 8. Be terse in chat. Tool output is shown separately — don't re-narrate it.
 9. REVIEW LOOP: After generating an image, call review_image on it. If the verdict is 'fail' or 'flag' (rating < 7), read the prompt deltas, revise your workflow accordingly, and regenerate. Iterate up to 3 times. If it still fails, show the user what you have and ask for guidance.
-10. REFERENCE IMAGES: When the user's message starts with [Reference images: ...], it contains the FULL workflow that produced those images — prompt, negative prompt, checkpoint, and LoRAs. This is YOUR starting point. You already have everything you need. Do NOT ask the user to repeat any of this. Build your workflow directly from the provided metadata, applying whatever changes the user requests. If the user says "same but change X", use the exact same prompt/checkpoint/loras and only modify X."""
+10. REFERENCE IMAGES: When the user's message starts with [Reference images: ...], it contains the FULL workflow that produced those images — prompt, negative prompt, checkpoint, and LoRAs. This is YOUR starting point. You already have everything you need. Do NOT ask the user to repeat any of this. Build your workflow directly from the provided metadata, applying whatever changes the user requests. If the user says "same but change X", use the exact same prompt/checkpoint/loras and only modify X.
+
+PROMPT ENGINEERING — CRITICAL RULES:
+The #1 failure mode is duplicate/extra characters. Follow these rules strictly:
+
+STRUCTURE: Subject count + subject → action → setting → style. Never style first.
+  GOOD: "1girl, solo, young woman standing on beach, sunset lighting, photorealistic"
+  BAD:  "photorealistic CGI Pixar style vibrant glow, beach woman sunset"
+
+CHARACTER COUNT: ALWAYS start with explicit count tags.
+  - Single person: "1girl, solo" or "1boy, solo" or "1woman, solo"
+  - Two people: "2people, couple, man and woman"
+  - Never leave count ambiguous. Words like "trio" or listing "female male" create extras.
+
+NEGATIVE PROMPT: Always include anti-duplicate tags:
+  "multiple people, duplicate, clone, crowd, extra person, extra face, extra body,
+   extra limbs, extra arms, extra hands, extra fingers, bad anatomy, deformed,
+   disfigured, mutation, worst quality, low quality, blurry, watermark, text"
+
+KEEP PROMPTS TIGHT: SD1.5 CLIP has a 77-token limit. SDXL has 154. Don't waste
+  tokens on verbose style descriptions. "photorealistic, detailed" beats
+  "almost photorealistic CGI animation style, Arcane hyper-detailed cel-shading,
+  Pixar/Blender flawless anatomy and lighting, vibrant soft glows".
+
+MODEL CHOICE FOR SCENES:
+  - Single character / portrait: DreamShaper 8 (SD1.5) is fine
+  - Multi-character / complex scenes: Use SDXL models (BigLove Ultra5, analXL)
+  - NSFW with good anatomy: BigLove Ultra5 + dmd2_sdxl_4step_lora
+  - Video: Wan 2.2 T2V pipeline (separate workflow)
+
+CFG GUIDANCE:
+  - SD1.5: cfg 7-9 (higher = tighter prompt adherence)
+  - SDXL: cfg 5-8
+  - Flux/Klein: cfg 1-3 (these models need LOW cfg)
+
+SAVE WORKING WORKFLOWS: When you get a good result, call save_workflow to preserve it."""
 
 # Grok-specific: stricter template. Grok struggles with open-ended workflow
 # construction, so we hand it an exact skeleton and ask it to substitute.
