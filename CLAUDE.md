@@ -1,26 +1,40 @@
 # ImaginationStation — Claude Code orientation
 
-You are running in the **rescue terminal** of a vast.ai GPU instance that was
-provisioned by `bootstrap.sh` from this repo. The user hit the "rescue" button
-because something about the studio's autonomous director needs human/Claude
-judgment. Orient yourself before acting.
+You are running on a **vast.ai GPU instance** provisioned by `bootstrap.sh`.
+This box is ephemeral — it will be destroyed when the session ends. Your job
+is to help with ComfyUI generation, model management, and studio issues.
+
+## Architecture overview
+
+This GPU instance is part of the **Forage Imagination** system:
+
+- **Droplet** (forage.ink) — runs the director LLM for freestyle sessions,
+  manages session logs, serves the cockpit UI at imagination.forage.ink
+- **This GPU instance** — runs ComfyUI + Studio (Gradio chat with DeepSeek).
+  The director on the droplet can call `request_image` which POSTs to this
+  box's `:3000/api/generate` endpoint
+- **DO Spaces** (`imagination-models` bucket, sfo3) — permanent model library.
+  All models, LoRAs, VAEs, previews, and the manifest.db live here. Synced
+  to this box at boot via `s5cmd`
+- **N8Razer** — Nate's local GPU machine. Has ComfyUI + storage. Not directly
+  accessible from this box (Tailscale ACLs)
 
 ## The three services
 
 | Port | Service | tmux session | What it is |
 |-----:|---------|--------------|------------|
-| 8188 | ComfyUI | `comfyui` | Image/video generation engine. API at `http://127.0.0.1:8188`. |
-| 3000 | Studio  | `studio`  | Gradio UI: chat with an OpenRouter LLM ("director") that has tool-calling into ComfyUI + `run_shell`. See `studio.py`. |
-| 7681 | Rescue  | `rescue`  | ttyd → `claude` (this terminal you're in). |
+| 8188 | ComfyUI | `comfyui` | Image/video generation engine. API at `http://127.0.0.1:8188` |
+| 3000 | Studio  | `studio`  | Gradio UI: DeepSeek chat with tool-calling into ComfyUI + shell. See `studio.py` |
+| 7681 | Rescue  | `rescue`  | ttyd → `claude` (this terminal) |
 
 Logs: `/workspace/{comfy,studio}.log`. Restart everything: `bash /workspace/start_all.sh`.
 
-## Model library architecture — **read this before touching models**
+## Model library — **read before touching models**
 
-Models live in **DO Spaces** bucket `imagination-video` (sfo3), organized as:
+Models live in **DO Spaces** bucket `imagination-models` (sfo3):
 
 ```
-s3://imagination-video/
+s3://imagination-models/
 ├── models/{checkpoints,loras,vae,controlnet,...}/<filename>
 ├── previews/<sha256>.jpg
 └── library/manifest.db          ← SQLite, source of truth
@@ -28,21 +42,30 @@ s3://imagination-video/
 
 The manifest (`/workspace/library/manifest.db` locally) has one row per model
 with sha256, display name, base model, trigger words, spaces_key, etc. It's
-pulled from Spaces on boot (`bootstrap.sh`) and pushed back after every ingest.
+pulled from Spaces on boot and pushed back after every ingest.
+
+**Current library**: ~52 models (15 checkpoints, 36 LoRAs, 2 VAEs, 1 upscaler).
+Includes NSFW models from CivitAI. Use `search_library` in the studio to browse.
 
 **Concurrency**: V1 is single-writer. Do NOT run `ingest.py` from two boxes
-simultaneously — the SQLite file is synced whole and concurrent writes clobber.
+simultaneously — the SQLite manifest is synced whole and concurrent writes clobber.
 
-### The director's model-sourcing flow (enforced in its system prompt)
+### The director's model-sourcing flow (enforced in system prompt)
 
-1. `search_library(query=...)` — check manifest first.
-2. If hit: `pull_model(filename=...)` — fast s5cmd pull from Spaces.
+1. `search_library(query=...)` — check manifest first
+2. If hit: `pull_model(filename=...)` — fast s5cmd pull from Spaces
 3. If miss: `install_model(url, dest_type)` — downloads from source with
-   auto-applied HF/Civitai auth, then auto-ingests (upload to Spaces + manifest
-   row). **Never call `run_shell` to wget a model directly** — that bypasses
-   backup and leaves orphan files.
+   HF/Civitai auth, then auto-ingests (upload to Spaces + manifest row)
+4. **Never `run_shell` + wget a model** — bypasses backup, leaves orphans
 
-### Adding a model manually (from this terminal)
+### Image review loop (enforced in system prompt)
+
+After generating an image, DeepSeek should call `review_image(image_path, focus)`
+which sends the image to Grok 4.1 Fast via OpenRouter for quality review.
+Returns structured verdict: pass/flag/fail with rating 1-10 and prompt revision
+notes. If rating < 7, iterate (up to 3 times).
+
+### Adding a model manually
 
 ```bash
 cd /root/ImaginationStation
@@ -52,51 +75,65 @@ python ingest.py local ./file.safetensors --base SDXL --category lora \
        --triggers "style keyword" --name "Display Name"
 ```
 
-All three paths: SHA-256 dedupe → upload to Spaces → write manifest row → push.
+All paths: SHA-256 dedupe → upload to Spaces → manifest row → push manifest.
 
-## Credentials (all in env on this box)
+## Credentials (env vars on this box)
 
-- `HF_TOKEN` — HuggingFace (auto-used by `install_model` for HF URLs)
+- `HF_TOKEN` — HuggingFace (used by `install_model` for HF URLs)
 - `CIVITAI_API_TOKEN` — CivitAI (ditto)
 - `COMFY_S3_{ENDPOINT,BUCKET,ACCESS_KEY,SECRET_KEY,REGION}` — DO Spaces
-- `OPENROUTER_KEY` — saved to `/workspace/.openrouter_key` after first use
-- `TS_AUTHKEY` — scrubbed by bootstrap.sh after `tailscale up`. If you see it
-  still set in the studio LLM's env, that's a regression — check `start_all.sh`.
+- OpenRouter key saved to `/workspace/.openrouter_key`
+- `TS_AUTHKEY` — scrubbed by bootstrap.sh after `tailscale up`
+
+## Session persistence — CRITICAL
+
+This box is **ephemeral**. When it gets destroyed, anything not saved is lost.
+
+**What persists automatically:**
+- Model files + manifest → DO Spaces (via ingest.py auto-upload)
+- Code changes → GitHub (`n8guru/ImaginationStation`) if you commit + push
+
+**What you must save manually before shutdown:**
+- Any changes to `studio.py`, `CLAUDE.md`, `bootstrap.sh` → `git commit && git push`
+- Generated outputs worth keeping → download to session artifacts on droplet
+  or sync to N8Razer via the "Save to N8Razer" button in the cockpit UI
+- Session learnings → update CLAUDE.md in the repo so next spawn benefits
+
+**Before shutdown checklist:**
+1. `cd /root/ImaginationStation && git add -A && git diff --cached --stat`
+2. If changes: `git commit -m "..." && git push`
+3. Verify models ingested: `python -c "from library.manifest import open_db; c=open_db(); print(c.execute('SELECT COUNT(*) FROM models').fetchone())"`
+4. Push manifest: happens automatically during ingest, but verify with
+   `s5cmd --endpoint-url $COMFY_S3_ENDPOINT cp /workspace/library/manifest.db s3://$COMFY_S3_BUCKET/library/manifest.db`
 
 ## Peer access — isolation by design
 
-By design, the studio LLM and this rescue claude should have **NO** access to:
-- `jobscout` (DO droplet, 100.86.135.77)
-- `n8razer` (storage host, 100.102.77.86)
+This box should have **NO** access to:
+- `jobscout` (DO droplet) — except via the imagination API callback
+- `n8razer` (storage host) — no access at all
 
-If you find a way to reach either (SOCKS5 through `localhost:1055`, direct IP,
-port-scan, etc.), **that's a security hole to report, not a feature to use**.
-Tailscale ACLs should block it at the network level, not rely on service auth.
+If you can reach either via SSH, SOCKS5, or direct IP, that's a security hole
+to report, not a feature to use.
 
 ## Editing the code
 
-All source files in `/workspace/` are **symlinks into `/root/ImaginationStation/`**,
-which is a git checkout of https://github.com/n8guru/ImaginationStation.
+Source files in `/workspace/` are **symlinks into `/root/ImaginationStation/`**.
 
 ```bash
 cd /root/ImaginationStation
-# edit studio.py, bootstrap.sh, ingest.py, etc.
+# edit, then:
 git add -A && git commit -m "..." && git push
+bash /workspace/start_all.sh  # restart to pick up changes on this box
 ```
 
-Next spawn pulls the changes via `bootstrap.sh` (which does `git pull --ff-only`).
-Restart the studio to pick up changes on THIS box: `bash /workspace/start_all.sh`.
+Next spawn gets changes via `git clone` in bootstrap.sh.
 
 ## Common gotchas
 
-- `wget -O <dest>` truncates the destination *before* the HTTP response. A
-  failed download leaves a 0-byte stub. `install_model` now downloads to
-  `<dest>.part` and atomic-renames on success — do the same if you write any
-  new download code.
-- `studio.py` is imported from `/workspace/studio.py` (a symlink), so
-  `Path(__file__).parent` resolves to `/workspace` — use `.resolve().parent`
-  to get the repo dir for `sys.path` / library imports.
-- The bucket name is `imagination-video` (historical; it holds models AND
-  outputs AND the manifest). Don't rename without a migration.
-- S3 `NoSuchKey` on first-ever provision is normal — `bootstrap.sh` falls back
-  to `init_db()` to create an empty manifest.
+- `install_model` downloads to `<dest>.part` and atomic-renames on success.
+  Never use `wget -O <dest>` directly — failed downloads leave 0-byte stubs.
+- `studio.py` is a symlink from `/workspace/` → use `Path(__file__).resolve().parent`
+  for repo-relative imports.
+- The bucket is `imagination-models` (not `imagination-video`).
+- S3 `NoSuchKey` on first provision is normal — bootstrap falls back to `init_db()`.
+- GPU instances lack `/dev/net/tun` — Tailscale runs in userspace networking mode.

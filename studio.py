@@ -50,7 +50,7 @@ Paths:
   - Outputs: /workspace/ComfyUI/output/
   - ComfyUI venv python: /workspace/ComfyUI/venv/bin/python
 
-Model library is backed by DO Spaces (bucket: imagination-video). Every model
+Model library is backed by DO Spaces (bucket: imagination-models). Every model
 you download gets auto-ingested so the next spawn has it without re-downloading.
 Installed custom nodes: ComfyUI-Manager, ComfyUI-AnimateDiff-Evolved, comfyui_controlnet_aux, ComfyUI_IPAdapter_plus, ComfyUI-Custom-Scripts.
 
@@ -250,7 +250,7 @@ def t_pull_model(filename):
     if dest.exists() and dest.stat().st_size > 0:
         return {"status": "already_on_disk", "path": str(dest),
                 "display_name": row["display_name"], "trigger_words": row["trigger_words"]}
-    bucket = os.environ.get("COMFY_S3_BUCKET", "imagination-video")
+    bucket = os.environ.get("COMFY_S3_BUCKET", "imagination-models")
     endpoint = os.environ.get("COMFY_S3_ENDPOINT", "https://sfo3.digitaloceanspaces.com")
     access = os.environ.get("COMFY_S3_ACCESS_KEY", "")
     secret = os.environ.get("COMFY_S3_SECRET_KEY", "")
