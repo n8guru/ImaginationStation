@@ -759,6 +759,11 @@ def chat(user_msg, display_hist, api_hist, api_key, model, selected_files=""):
                         parts.append(f"  checkpoint: {meta['checkpoint']}")
                     if meta["loras"]:
                         parts.append(f"  loras: {', '.join(meta['loras'])}")
+                    if meta.get("sampler"):
+                        s = meta["sampler"]
+                        parts.append(f"  sampler: {', '.join(f'{k}={v}' for k,v in s.items() if k != 'seed')}")
+                    if meta.get("resolution"):
+                        parts.append(f"  resolution: {meta['resolution']}")
                     ref_parts.append("\n".join(parts))
                 else:
                     ref_parts.append(f"  file: {fname} (no workflow metadata)")
@@ -879,7 +884,7 @@ def refresh_gallery():
     return _list_outputs()
 
 def _extract_png_meta(path):
-    """Extract prompt, negative, checkpoint, loras from ComfyUI PNG metadata."""
+    """Extract prompt, negative, checkpoint, loras, sampler from ComfyUI PNG metadata."""
     try:
         from PIL import Image
         img = Image.open(path)
@@ -889,25 +894,52 @@ def _extract_png_meta(path):
         nodes = json.loads(raw)
         positive = negative = checkpoint = ""
         loras = []
+        sampler = {}
+        resolution = ""
+        clip_texts = []  # collect all CLIP texts, sort later
+
         for nid, node in nodes.items():
             ct = node.get("class_type", "")
             inp = node.get("inputs", {})
             if ct == "CLIPTextEncode":
                 txt = inp.get("text", "")
-                # Heuristic: shorter or negative-keyword text is the negative prompt
-                if any(w in txt.lower() for w in ["worst quality", "blurry", "deformed", "ugly"]):
-                    negative = txt
-                elif not positive or len(txt) > len(positive):
-                    positive = txt
-            elif ct == "CheckpointLoaderSimple":
+                if txt:
+                    clip_texts.append((nid, txt))
+            elif "CheckpointLoader" in ct:
                 checkpoint = inp.get("ckpt_name", "")
             elif ct == "LoraLoader":
                 ln = inp.get("lora_name", "")
                 sw = inp.get("strength_model", "")
                 if ln:
                     loras.append(f"{ln} ({sw})")
+            elif "KSampler" in ct:
+                for k in ["steps", "cfg", "sampler_name", "scheduler", "denoise", "seed"]:
+                    if k in inp:
+                        sampler[k] = inp[k]
+            elif "LatentImage" in ct or "EmptyLatent" in ct:
+                w, h = inp.get("width"), inp.get("height")
+                if w and h:
+                    resolution = f"{w}x{h}"
+
+        # Sort CLIP texts into positive/negative
+        NEG_WORDS = {"worst quality", "blurry", "deformed", "ugly", "bad anatomy",
+                     "bad hands", "missing fingers", "extra fingers", "low quality",
+                     "disfigured", "mutation", "watermark"}
+        for nid, txt in clip_texts:
+            txt_lower = txt.lower()
+            # Check if it's a negative prompt (contains negative keywords or node ID hints)
+            is_neg = (any(w in txt_lower for w in NEG_WORDS)
+                      or "neg" in str(nid).lower())
+            if is_neg:
+                if not negative or len(txt) > len(negative):
+                    negative = txt
+            else:
+                if not positive or len(txt) > len(positive):
+                    positive = txt
+
         return {"positive": positive, "negative": negative,
-                "checkpoint": checkpoint, "loras": loras}
+                "checkpoint": checkpoint, "loras": loras,
+                "sampler": sampler, "resolution": resolution}
     except Exception:
         return None
 
@@ -939,6 +971,12 @@ def refresh_output_html():
                 parts.append(f"<b>Checkpoint:</b> {meta['checkpoint']}")
             if meta["loras"]:
                 parts.append(f"<b>LoRAs:</b> {', '.join(meta['loras'])}")
+            if meta.get("sampler"):
+                s = meta["sampler"]
+                sampler_str = ", ".join(f"{k}={v}" for k, v in s.items() if k != "seed")
+                parts.append(f"<b>Sampler:</b> {sampler_str}")
+            if meta.get("resolution"):
+                parts.append(f"<b>Resolution:</b> {meta['resolution']}")
             details_html = f'''<details style="margin-top:2px;" onclick="event.stopPropagation()">
   <summary style="font-size:10px;color:#666;cursor:pointer;list-style:none;display:flex;align-items:center;gap:3px;">
     <span style="font-size:7px;">&#9654;</span> workflow</summary>
@@ -990,7 +1028,7 @@ function openLightbox(src) {
 }
 function deleteFile(name) {
   if (!confirm('Delete ' + name + '?')) return;
-  fetch('/gradio_api/delete_output', {
+  fetch('/api/delete_output', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({name: name})
   });
@@ -1176,7 +1214,8 @@ if __name__ == "__main__":
 
     app = FastAPI()
 
-    @app.post("/gradio_api/delete_output")
+    # Register custom API routes BEFORE mounting Gradio (which catches /)
+    @app.post("/api/delete_output")
     async def api_delete_output(request: Request):
         data = await request.json()
         name = (data.get("name") or "").strip()
