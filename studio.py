@@ -557,7 +557,7 @@ def t_review_image(image_path, focus="overall quality, composition, and style",
     content_blocks.append({"type": "text", "text": system_text})
 
     try:
-        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key, timeout=30.0)
         resp = client.chat.completions.create(
             model=VISION_MODEL,
             max_tokens=500,
@@ -2194,9 +2194,10 @@ RULES:
         user_msg += '\n\nRespond with ONLY a JSON object: {"positive": "...", "negative": "..."}'
 
         try:
-            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key,
+                            timeout=30.0)
             resp = client.chat.completions.create(
-                model="deepseek/deepseek-chat",  # fast + cheap for prompt formatting
+                model=VISION_MODEL,  # Grok — fast, already in use for reviews
                 max_tokens=500,
                 messages=[
                     {"role": "system", "content": system},
