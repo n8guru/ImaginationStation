@@ -676,6 +676,12 @@ def t_save_workflow(name, workflow, notes=""):
         except Exception:
             pass  # local save succeeded, S3 backup is best-effort
 
+    # Also copy into ComfyUI user workflows so it appears in the sidebar
+    comfy_wf_dir = COMFY_ROOT / "user" / "default" / "workflows"
+    comfy_wf_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    shutil.copy2(str(path), str(comfy_wf_dir / filename))
+
     return {"status": "saved", "name": name, "path": str(path), "filename": filename}
 
 TOOL_FNS = {

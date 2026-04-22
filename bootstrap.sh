@@ -177,6 +177,22 @@ ln -sf "$REPO_DIR/start_all.sh"   "$WORKSPACE/start_all.sh"
 ln -sf "$REPO_DIR/CLAUDE.md"      "$WORKSPACE/CLAUDE.md"
 chmod +x "$REPO_DIR/rescue.sh" "$REPO_DIR/start_all.sh" "$REPO_DIR/bootstrap.sh"
 
+# 5b. Pull saved workflows from Spaces into ComfyUI's user workflows dir
+# so they appear in the sidebar without manual loading
+if [ -n "${COMFY_S3_ACCESS_KEY:-}" ] && [ -n "${COMFY_S3_SECRET_KEY:-}" ]; then
+    mkdir -p "$COMFY/user/default/workflows" "$WORKSPACE/workflows"
+    export AWS_ACCESS_KEY_ID="$COMFY_S3_ACCESS_KEY"
+    export AWS_SECRET_ACCESS_KEY="$COMFY_S3_SECRET_KEY"
+    S5="s5cmd --endpoint-url ${COMFY_S3_ENDPOINT:-https://sfo3.digitaloceanspaces.com}"
+    log "pulling saved workflows from Spaces..."
+    $S5 sync "s3://${BUCKET}/workflows/*" "$WORKSPACE/workflows/" 2>/dev/null || true
+    # Copy into ComfyUI user dir (flatten subdirs)
+    find "$WORKSPACE/workflows" -name '*.json' -exec cp {} "$COMFY/user/default/workflows/" \;
+    WF_COUNT=$(find "$COMFY/user/default/workflows" -name '*.json' | wc -l)
+    log "$WF_COUNT workflows loaded into ComfyUI"
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+fi
+
 # 6. Launch
 log "starting services"
 bash "$WORKSPACE/start_all.sh"
