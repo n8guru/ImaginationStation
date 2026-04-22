@@ -443,11 +443,15 @@ def _get_openrouter_key():
 
 VISION_MODEL = "x-ai/grok-4.1-fast"
 
-def t_review_image(image_path, focus="overall quality, composition, and style"):
+def t_review_image(image_path, focus="overall quality, composition, and style",
+                   reference_paths=None):
     """Send a generated image to Grok vision for quality review.
 
     Returns a structured verdict: pass/flag/fail with a numeric rating,
     what works, what doesn't, and specific revision notes for regeneration.
+
+    If reference_paths is provided, the reviewer compares the generated image
+    against the reference images for anatomy size/shape/position consistency.
     """
     import base64
     api_key = _get_openrouter_key()
@@ -489,14 +493,44 @@ def t_review_image(image_path, focus="overall quality, composition, and style"):
         if meta["loras"]:
             intent_context += f"LoRAs: {', '.join(meta['loras'])}\n"
 
+    # Build reference comparison context
+    ref_context = ""
+    ref_content_blocks = []
+    if reference_paths:
+        ref_context = (
+            "\nREFERENCE IMAGE COMPARISON:\n"
+            "Reference images are provided alongside the generated image. Compare the generated "
+            "image against the references for:\n"
+            "- ANATOMY ACCURACY: Do body parts match the size, shape, and proportions shown in references?\n"
+            "- POSITION/POSE: Does the pose match what the references demonstrate?\n"
+            "- ANATOMICAL IDENTITY: If the prompt requests specific anatomy (anal, vaginal, etc.), "
+            "verify the generated image shows the CORRECT anatomy — not a substitution.\n"
+            "- FACE/STYLE CONSISTENCY: Does the face match the reference character?\n"
+            f"Number of reference images: {len(reference_paths)}\n"
+        )
+        for i, rp in enumerate(reference_paths):
+            rpath = Path(rp)
+            if rpath.exists() and rpath.stat().st_size < 10_000_000:
+                rext = rpath.suffix.lower().lstrip(".")
+                rmime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                         "webp": "image/webp"}.get(rext, "image/png")
+                rb64 = base64.b64encode(rpath.read_bytes()).decode()
+                ref_content_blocks.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{rmime};base64,{rb64}"},
+                })
+
     system_text = (
         "You are reviewing a generated image against its intended prompt.\n"
         f"Focus: {focus}\n"
         f"{intent_context}\n"
+        f"{ref_context}\n"
         "REVIEW PRIORITIES (in order):\n"
         "1. FACTUAL ACCURACY: Correct number of people? Correct body positions/poses as described?\n"
         "   Count heads, limbs, bodies. Flag extra/missing people immediately.\n"
         "2. ANATOMICAL CORRECTNESS: Right number of hands, fingers, limbs? Natural proportions?\n"
+        "   If references provided: compare anatomy size, shape, and position against references.\n"
+        "   If prompt specifies anal anatomy, verify it is NOT vaginal (common substitution error).\n"
         "3. PROMPT ADHERENCE: Does the scene match what the prompt describes?\n"
         "4. COMPOSITION & QUALITY: Lighting, framing, style.\n\n"
         "Respond with ONLY a JSON object (no markdown, no extra text):\n"
@@ -504,24 +538,30 @@ def t_review_image(image_path, focus="overall quality, composition, and style"):
         '"people_count": "expected N, found N", '
         '"position_correct": true/false, '
         '"anatomy_issues": "list any problems or empty string", '
+        '"reference_match": "how well the generated image matches references (or n/a if none)", '
         '"strengths": "what works well", '
         '"weaknesses": "what needs improvement", '
         '"positive_prompt_delta": "what to add or keep in the prompt", '
         '"negative_prompt_delta": "what to remove or avoid in the prompt", '
         '"recommendation": "approve|iterate|rethink"}\n\n'
         "Rating guide: 7+ = pass, 4-6 = flag (fixable issues), 1-3 = fail (start over).\n"
-        "Wrong number of people or badly wrong positions = automatic fail (rating 1-3)."
+        "Wrong number of people or badly wrong positions = automatic fail (rating 1-3).\n"
+        "Anatomy substitution (e.g. vaginal shown when anal requested) = automatic fail (rating 1-2)."
     )
+
+    # Build message content: reference images first, then generated image, then text
+    content_blocks = []
+    for rb in ref_content_blocks:
+        content_blocks.append(rb)
+    content_blocks.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}})
+    content_blocks.append({"type": "text", "text": system_text})
 
     try:
         client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
         resp = client.chat.completions.create(
             model=VISION_MODEL,
             max_tokens=500,
-            messages=[{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
-                {"type": "text", "text": system_text},
-            ]}],
+            messages=[{"role": "user", "content": content_blocks}],
         )
         review_text = resp.choices[0].message.content or ""
 
@@ -853,10 +893,11 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "review_image",
-        "description": "Send a generated image to Grok vision for quality review. Returns a structured verdict (pass/flag/fail) with a 1-10 rating, strengths, weaknesses, and specific prompt revision notes. Use after generating an image to check quality. If verdict is 'fail' or 'flag', use the prompt deltas to revise your workflow and regenerate. Iterate up to 3 times.",
+        "description": "Send a generated image to Grok vision for quality review. Returns a structured verdict (pass/flag/fail) with a 1-10 rating, strengths, weaknesses, and specific prompt revision notes. Use after generating an image to check quality. If verdict is 'fail' or 'flag', use the prompt deltas to revise your workflow and regenerate. Iterate up to 3 times. When reference images were used for generation, pass them here too so the reviewer can compare anatomy size/shape/position against the references.",
         "parameters": {"type": "object", "properties": {
             "image_path": {"type": "string", "description": "Path to the image file (can be relative to output dir, e.g. 'ComfyUI_00042_.png')"},
             "focus": {"type": "string", "description": "What to focus on in the review (e.g. 'character consistency', 'lighting quality', 'overall composition'). Default: general quality."},
+            "reference_paths": {"type": "array", "items": {"type": "string"}, "description": "Optional list of reference image paths used during generation. The reviewer will compare the generated image against these for anatomy, pose, and style consistency."},
         }, "required": ["image_path"]}
     }},
     {"type": "function", "function": {
@@ -1596,6 +1637,8 @@ if __name__ == "__main__":
                 workflow[ipa_id] = {"class_type": "IPAdapterAdvanced", "inputs": {
                     "weight": round(w, 2),
                     "weight_type": "linear",
+                    "combine_embeds": "concat",
+                    "embeds_scaling": "V only",
                     "start_at": 0.0,
                     "end_at": 1.0,
                     "model": [prev_model, 0],
@@ -1665,11 +1708,15 @@ if __name__ == "__main__":
         if not files:
             return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
 
-        # Run review on first image
+        # Run review on first image — pass reference images for comparison
         review = {}
         img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
         if img_path.exists():
-            review = t_review_image(str(img_path), focus="prompt adherence, anatomy, character count")
+            review = t_review_image(
+                str(img_path),
+                focus="prompt adherence, anatomy, character count",
+                reference_paths=ref_local_paths or None,
+            )
 
         return JSONResponse({
             "files": files,
