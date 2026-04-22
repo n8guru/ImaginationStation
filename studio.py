@@ -2407,7 +2407,17 @@ RULES:
                 return FileResponse(str(candidate))
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    demo.queue()
-    app = gr.mount_gradio_app(app, demo, path="/",
-                               allowed_paths=[str(OUTPUT_DIR)])
+    # Gradio UI disabled — API-only mode for pipeline use.
+    # Uncomment to re-enable interactive studio:
+    # demo.queue()
+    # app = gr.mount_gradio_app(app, demo, path="/",
+    #                            allowed_paths=[str(OUTPUT_DIR)])
+
+    @app.get("/")
+    async def index():
+        return JSONResponse({"status": "ok", "mode": "api-only", "endpoints": [
+            "/api/generate", "/api/calibrate", "/api/merge", "/api/merge/models",
+            "/api/output/{filename}",
+        ]})
+
     uvicorn.run(app, host="0.0.0.0", port=3000)
