@@ -440,17 +440,41 @@ def t_review_image(image_path, focus="overall quality, composition, and style"):
     mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
             "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/png")
 
+    # Extract workflow metadata from PNG so the reviewer knows what was intended
+    meta = _extract_png_meta(str(p))
+    intent_context = ""
+    if meta:
+        if meta["positive"]:
+            intent_context += f"\nINTENDED PROMPT (what the image should depict):\n{meta['positive']}\n"
+        if meta["negative"]:
+            intent_context += f"\nNEGATIVE PROMPT (what should NOT appear):\n{meta['negative']}\n"
+        if meta["checkpoint"]:
+            intent_context += f"\nCheckpoint: {meta['checkpoint']}\n"
+        if meta["loras"]:
+            intent_context += f"LoRAs: {', '.join(meta['loras'])}\n"
+
     system_text = (
-        "You are a film director reviewing a generated image.\n"
-        f"Focus: {focus}\n\n"
+        "You are reviewing a generated image against its intended prompt.\n"
+        f"Focus: {focus}\n"
+        f"{intent_context}\n"
+        "REVIEW PRIORITIES (in order):\n"
+        "1. FACTUAL ACCURACY: Correct number of people? Correct body positions/poses as described?\n"
+        "   Count heads, limbs, bodies. Flag extra/missing people immediately.\n"
+        "2. ANATOMICAL CORRECTNESS: Right number of hands, fingers, limbs? Natural proportions?\n"
+        "3. PROMPT ADHERENCE: Does the scene match what the prompt describes?\n"
+        "4. COMPOSITION & QUALITY: Lighting, framing, style.\n\n"
         "Respond with ONLY a JSON object (no markdown, no extra text):\n"
         '{"rating": 1-10, "verdict": "pass|flag|fail", '
+        '"people_count": "expected N, found N", '
+        '"position_correct": true/false, '
+        '"anatomy_issues": "list any problems or empty string", '
         '"strengths": "what works well", '
         '"weaknesses": "what needs improvement", '
         '"positive_prompt_delta": "what to add or keep in the prompt", '
         '"negative_prompt_delta": "what to remove or avoid in the prompt", '
         '"recommendation": "approve|iterate|rethink"}\n\n'
-        "Rating guide: 7+ = pass, 4-6 = flag (fixable issues), 1-3 = fail (start over)."
+        "Rating guide: 7+ = pass, 4-6 = flag (fixable issues), 1-3 = fail (start over).\n"
+        "Wrong number of people or badly wrong positions = automatic fail (rating 1-3)."
     )
 
     try:
