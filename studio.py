@@ -927,6 +927,25 @@ def sync_to_n8razer():
     except Exception as e:
         return gr.update(value=f"Sync failed: {e}", visible=True)
 
+def add_reference_images(file_list):
+    """Copy uploaded reference images into the ComfyUI output dir so they appear in the strip."""
+    if not file_list:
+        return None
+    import shutil
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    added = []
+    for f in file_list:
+        src = Path(f) if isinstance(f, str) else Path(f.name)
+        if not src.exists():
+            continue
+        dest_name = f"ref_{src.name}" if not src.name.startswith("ref_") else src.name
+        dest = OUTPUT_DIR / dest_name
+        shutil.copy2(str(src), str(dest))
+        added.append(dest_name)
+        # Invalidate cache so it shows on next refresh
+        _meta_cache.pop(str(dest), None)
+    return None  # clear the file picker after upload
+
 saved_key = API_KEY_FILE.read_text().strip() if API_KEY_FILE.exists() else ""
 
 # ---- UI ----
@@ -971,10 +990,12 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
         with gr.Column(scale=2, min_width=300, elem_id="output-strip"):
             with gr.Row():
                 gr.Markdown("### Outputs")
-                deselect_btn = gr.Button("Clear selection", size="sm", scale=0, min_width=120)
+                deselect_btn = gr.Button("Clear selection", size="sm", scale=0, min_width=100)
             output_html = gr.HTML(value=refresh_output_html() + OUTPUT_STRIP_JS,
                                   elem_id="output-html")
             selected_state = gr.Textbox(value="", visible=False, elem_id="selected-files-state")
+            ref_upload = gr.File(label="Add reference images", file_count="multiple",
+                                 file_types=["image"], height=60)
             with gr.Row():
                 refresh_btn = gr.Button("↻ Refresh", size="sm", scale=1)
                 sync_btn = gr.Button("💾 N8Razer", size="sm", scale=1,
@@ -1004,6 +1025,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
                [msg, chatbot, api_state]).then(_refresh_html, None, output_html)
     clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
     refresh_btn.click(_refresh_html, None, output_html)
+    ref_upload.change(add_reference_images, ref_upload, ref_upload).then(_refresh_html, None, output_html)
     deselect_btn.click(lambda: "", None, selected_state, js="() => { clearSelections(); }")
     sync_btn.click(sync_to_n8razer, None, sync_status)
     api_key.change(save_key, api_key, None)
