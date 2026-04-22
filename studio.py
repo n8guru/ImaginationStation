@@ -2009,6 +2009,74 @@ if __name__ == "__main__":
             },
         })
 
+    # Model knowledge — trigger words, quality tags, and style guidance per checkpoint/LoRA.
+    # Extracted from safetensors ss_tag_frequency and modelspec metadata.
+    MODEL_KNOWLEDGE = {
+        "checkpoints": {
+            "bigLove_ultra5": {
+                "arch": "SDXL", "trigger": "biglove ultra5",
+                "quality_tags": "masterpiece, best quality, ultra detailed, photorealistic, realistic",
+                "style_notes": "Photorealistic model. Strong on single-character portraits and anatomy.",
+            },
+            "forage_v2_biglove_analxl": {
+                "arch": "SDXL", "trigger": "biglove ultra5",
+                "quality_tags": "masterpiece, best quality, ultra detailed, photorealistic, realistic",
+                "style_notes": "Merged BigLove+analXL. Strong anatomy + explicit detail. Use for all SDXL scenes.",
+            },
+            "analXL_v3": {
+                "arch": "SDXL", "trigger": "photograph dataset",
+                "quality_tags": "masterpiece, best quality, detailed, photorealistic",
+                "style_notes": "Anime-derived but photorealistic capable. Good explicit anatomy.",
+            },
+            "gangbangDiffusion_v50": {
+                "arch": "SD1.5", "trigger": "",
+                "quality_tags": "masterpiece, best quality, detailed, photorealistic, realistic",
+                "style_notes": "SD1.5 model specialized for multi-person explicit scenes. Use Danbooru-style tags. Good at 2+ person compositions.",
+            },
+            "dreamshaper_8": {
+                "arch": "SD1.5", "trigger": "",
+                "quality_tags": "masterpiece, best quality, detailed",
+                "style_notes": "General purpose SD1.5. Good for stylized/artistic scenes.",
+            },
+        },
+        "loras": {
+            "anal_licking": {
+                "trigger": "anallicking",
+                "top_tags": "tongue, realistic, hetero, pubic hair, pov, oral",
+            },
+            "NsfwPovAllInOneLoraSdxl": {
+                "trigger": "",
+                "top_tags": "realistic, looking at viewer, lips, breasts, undressing, nipples, uncensored, nude",
+            },
+            "dmd2_sdxl_4step_lora": {
+                "trigger": "",
+                "top_tags": "",
+                "notes": "Distillation LoRA — use for 4-step fast generation. Reduces steps from 25 to 4.",
+            },
+        },
+    }
+
+    def _get_model_context(checkpoint):
+        """Build model-aware context string for the prompt optimizer."""
+        # Match checkpoint name to knowledge base
+        ckpt_info = None
+        for key, info in MODEL_KNOWLEDGE["checkpoints"].items():
+            if key.lower() in checkpoint.lower():
+                ckpt_info = info
+                break
+
+        if not ckpt_info:
+            return "", "SDXL", 154
+
+        arch = ckpt_info["arch"]
+        token_limit = 154 if arch == "SDXL" else 77
+        context = f"Checkpoint: {checkpoint} ({arch})\n"
+        if ckpt_info["trigger"]:
+            context += f"TRIGGER WORD (must include in positive prompt): {ckpt_info['trigger']}\n"
+        context += f"Quality tags to include: {ckpt_info['quality_tags']}\n"
+        context += f"Style notes: {ckpt_info['style_notes']}\n"
+        return context, arch, token_limit
+
     def _optimize_prompt(description, checkpoint, has_references,
                          review_feedback=None, previous_pos=None, previous_neg=None):
         """Use a fast LLM to convert a natural-language description into
@@ -2019,27 +2087,27 @@ if __name__ == "__main__":
         """
         api_key = _get_openrouter_key()
         if not api_key:
-            # Fallback: basic formatting without LLM
             return description, "bad anatomy, worst quality, low quality, blurry"
 
-        is_sdxl = any(k in checkpoint.lower() for k in ["sdxl", "biglove", "ultra", "analxl"])
-        token_limit = 154 if is_sdxl else 77
+        model_context, arch, token_limit = _get_model_context(checkpoint)
+        is_sdxl = arch == "SDXL"
 
         system = f"""You are an expert Stable Diffusion prompt engineer. Convert the user's image description into optimized prompts for ComfyUI.
 
-CONTEXT:
-- Checkpoint: {checkpoint} ({'SDXL' if is_sdxl else 'SD1.5'})
+MODEL CONTEXT:
+{model_context}
 - Token limit: ~{token_limit} tokens (be concise, use tags not sentences)
 - Reference images: {'YES — reference provides face/pose guidance, prompt controls content' if has_references else 'none'}
 
 RULES:
-1. POSITIVE PROMPT: Convert to comma-separated SD tags. Lead with character count tag (1girl, 2girls, 1boy, 3people, etc). Include: subject, action, composition, lighting, style, quality tags.
-2. NEGATIVE PROMPT: Context-appropriate negatives. Always include quality negatives (worst quality, low quality, blurry, bad anatomy, deformed, bad shadows, harsh shadows).
+1. POSITIVE PROMPT: Start with the model's trigger word (if any), then character count tag (1girl, 2girls, 1boy, 3people, etc), then subject/action/composition/lighting/style tags. Include the model's quality tags.
+2. NEGATIVE PROMPT: Context-appropriate negatives. Always include: worst quality, low quality, blurry, bad anatomy, deformed, bad shadows, harsh shadows.
 3. CHARACTER COUNT: Count people described. Use exact tags: 1girl, 1boy, 2girls, 1boy 1girl, 3people, etc. NEVER add "solo" if multiple people are described.
 4. NUDITY: If the description requests nudity/explicit content, do NOT add clothing tags to positive. Add clothing terms to negative (clothes, dressed, shirt, fabric, etc).
 5. REFERENCE IMAGES: If references are present and description is nude, add strong clothing negatives since references may be clothed.
 6. ANATOMY: If specific anatomy is requested (anal, vaginal, etc), be explicit in positive and add the WRONG anatomy to negative (e.g. if anal requested, add "vaginal" to negative).
-7. Keep it tight — no verbose descriptions. Tags, not sentences."""
+7. TRIGGER WORDS: If the model has a trigger word, it MUST appear in the positive prompt. For LoRAs with trigger words, include those too.
+8. Keep it tight — tags, not sentences. Prioritize the most important descriptors within the token limit."""
 
         user_msg = f"DESCRIPTION: {description}"
         if review_feedback:
