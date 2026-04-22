@@ -777,7 +777,7 @@ def refresh_output_html():
         cards.append(f'''<div class="out-card" data-path="{name}" onclick="toggleSelect(this)"
              style="margin-bottom:8px;border:2px solid transparent;border-radius:8px;
                     padding:4px;cursor:pointer;transition:border-color 0.15s;">
-  <img src="/file={path}" style="width:100%;border-radius:6px;display:block;"
+  <img src="/gradio_api/file={path}" style="width:100%;border-radius:6px;display:block;"
        onclick="event.stopPropagation();openLightbox(this.src)" loading="lazy">
   <div style="font-family:monospace;font-size:11px;color:#aaa;padding:4px 2px 0;
               user-select:all;word-break:break-all;">{name}</div>
