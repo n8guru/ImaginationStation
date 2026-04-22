@@ -1698,7 +1698,7 @@ RULES:
                 workflow[load_id] = {"class_type": "LoadImage", "inputs": {"image": ref_name}}
                 workflow[ipa_id] = {"class_type": "IPAdapterAdvanced", "inputs": {
                     "weight": round(w, 2),
-                    "weight_type": "style transfer",
+                    "weight_type": "linear",
                     "combine_embeds": "concat",
                     "embeds_scaling": "V only",
                     "start_at": 0.2,
