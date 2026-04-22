@@ -98,6 +98,23 @@ KEY_NODES=(
     "https://github.com/Fannovel16/comfyui_controlnet_aux.git"
     "https://github.com/cubiq/ComfyUI_IPAdapter_plus.git"
     "https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git"
+    # Video pipeline nodes (Wan 2.2 T2V/I2V/FLF2V)
+    "https://github.com/kijai/ComfyUI-WanVideoWrapper.git"
+    "https://github.com/kijai/ComfyUI-KJNodes.git"
+    "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
+    "https://github.com/Fannovel16/ComfyUI-Frame-Interpolation.git"
+    # Daxamur workflow dependencies
+    "https://github.com/rgthree/rgthree-comfy.git"
+    "https://github.com/M1kep/ComfyLiterals.git"
+    "https://github.com/HavocsCall/comfyui_HavocsCall_Custom_Nodes.git"
+    "https://github.com/Daxamur/DaxNodes.git"
+    "https://github.com/cubiq/ComfyUI_essentials.git"
+    # Utility nodes
+    "https://github.com/ltdrdata/ComfyUI-Impact-Pack.git"
+    "https://github.com/ltdrdata/ComfyUI-Inspire-Pack.git"
+    "https://github.com/yolain/ComfyUI-Easy-Use.git"
+    "https://github.com/WASasquatch/was-node-suite-comfyui.git"
+    "https://github.com/chrisgoringe/cg-use-everywhere.git"
 )
 for url in "${KEY_NODES[@]}"; do
     dir=$(basename "$url" .git)
