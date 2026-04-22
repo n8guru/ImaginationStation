@@ -1800,8 +1800,8 @@ if __name__ == "__main__":
 
     def _load_calibration_profile(ref_names, ckpt):
         """Load a calibration profile matching these reference images + checkpoint."""
+        import hashlib
         CALIBRATION_DIR.mkdir(parents=True, exist_ok=True)
-        # Hash ref names for lookup
         key = hashlib.md5((",".join(sorted(ref_names)) + "|" + ckpt).encode()).hexdigest()[:12]
         profile_path = CALIBRATION_DIR / f"cal_{key}.json"
         if profile_path.exists():
