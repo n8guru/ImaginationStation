@@ -1724,6 +1724,79 @@ if __name__ == "__main__":
     # ---- Calibration helpers ----
 
     CALIBRATION_DIR = OUTPUT_DIR / "calibration_profiles"
+    RECIPE_DIR = OUTPUT_DIR / "recipes"
+
+    def _save_recipe(description, checkpoint, pos, neg, rating, has_refs):
+        """Save a successful prompt as a reusable recipe."""
+        RECIPE_DIR.mkdir(parents=True, exist_ok=True)
+        import hashlib
+        from datetime import datetime, timezone
+        recipe = {
+            "description_hash": hashlib.md5(description[:200].lower().encode()).hexdigest()[:10],
+            "description": description[:500],
+            "checkpoint": checkpoint,
+            "positive": pos,
+            "negative": neg,
+            "rating": rating,
+            "has_references": has_refs,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Extract keywords for fuzzy matching
+        keywords = set()
+        for word in description.lower().split():
+            w = word.strip(",.!?()[]{}\"'")
+            if len(w) > 3:
+                keywords.add(w)
+        recipe["keywords"] = list(keywords)
+
+        fname = f"recipe_{recipe['description_hash']}_{rating}.json"
+        (RECIPE_DIR / fname).write_text(json.dumps(recipe, indent=2))
+        return fname
+
+    def _find_recipe(description, checkpoint, has_refs):
+        """Find the best matching recipe for a description. Returns (pos, neg) or None."""
+        if not RECIPE_DIR.exists():
+            return None
+        recipes = []
+        for f in RECIPE_DIR.iterdir():
+            if not f.name.endswith(".json"):
+                continue
+            try:
+                r = json.loads(f.read_text())
+                recipes.append(r)
+            except Exception:
+                continue
+        if not recipes:
+            return None
+
+        # Score each recipe by keyword overlap with the description
+        desc_words = set()
+        for word in description.lower().split():
+            w = word.strip(",.!?()[]{}\"'")
+            if len(w) > 3:
+                desc_words.add(w)
+
+        best = None
+        best_score = 0
+        for r in recipes:
+            # Must match checkpoint type (SDXL vs SD1.5)
+            r_is_sdxl = any(k in r.get("checkpoint", "").lower() for k in ["sdxl", "biglove", "ultra", "analxl", "forage"])
+            d_is_sdxl = any(k in checkpoint.lower() for k in ["sdxl", "biglove", "ultra", "analxl", "forage"])
+            if r_is_sdxl != d_is_sdxl:
+                continue
+            # Keyword overlap
+            r_keywords = set(r.get("keywords", []))
+            overlap = len(desc_words & r_keywords)
+            # Weight by rating and overlap
+            score = overlap * r.get("rating", 5)
+            if score > best_score:
+                best_score = score
+                best = r
+
+        # Need at least 3 keyword matches to trust the recipe
+        if best and best_score >= 21:  # 3 keywords × rating 7
+            return best["positive"], best["negative"]
+        return None
 
     def _build_ipa_workflow(ckpt, pos, neg, ref_names, seed,
                             weight=0.3, weight_type="linear",
@@ -2204,10 +2277,15 @@ RULES:
 
         seed = random.randint(1, 9999999)
 
-        # Smart prompt optimization — LLM rewrites description into proper
-        # SD/SDXL tag format with context-appropriate positive + negative prompts
+        # Start from success: check for a proven recipe first, fall back to LLM optimizer
         has_refs = bool(ref_images_raw or ref_image_data)
-        pos, neg = _optimize_prompt(description, ckpt, has_refs)
+        recipe_match = _find_recipe(description, ckpt, has_refs)
+        if recipe_match:
+            pos, neg = recipe_match
+            prompt_source = "recipe"
+        else:
+            pos, neg = _optimize_prompt(description, ckpt, has_refs)
+            prompt_source = "optimizer"
 
         # Handle reference images — download URLs or resolve local paths
         ref_local_paths = []
@@ -2295,7 +2373,7 @@ RULES:
             }
 
         # Generate → review → iterate loop (up to 5 attempts)
-        MAX_ATTEMPTS = 5
+        MAX_ATTEMPTS = 3
         review = {}
         files = []
         all_attempts = []
@@ -2354,8 +2432,9 @@ RULES:
                 "verdict": verdict,
             })
 
-            # Pass (rating >= 7) — done
+            # Pass (rating >= 7) — save recipe and done
             if rating >= 7 or verdict == "pass":
+                _save_recipe(description, ckpt, pos, neg, rating, has_refs)
                 break
 
             # Fail — smart rewrite: LLM re-optimizes prompt using review feedback
@@ -2385,6 +2464,7 @@ RULES:
             "files": files,
             "prompt_id": prompt_id,
             "checkpoint": ckpt,
+            "prompt_source": prompt_source,
             "has_reference": bool(ref_local_paths),
             "reference_count": len(ref_local_paths),
             "reference_weight": ref_weight if ref_local_paths else None,
