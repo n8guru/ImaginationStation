@@ -726,7 +726,7 @@ def dispatch(name, args):
         return {"error": str(e), "type": type(e).__name__, "tb": traceback.format_exc()[-1000:]}
 
 # ---- Chat loop ----
-MAX_STEPS = 50
+MAX_STEPS = 120
 
 def chat(user_msg, display_hist, api_hist, api_key, model, selected_files=""):
     if not user_msg.strip():
