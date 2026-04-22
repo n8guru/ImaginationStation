@@ -921,8 +921,13 @@ function openLightbox(src) {
 }
 function deleteFile(name) {
   if (!confirm('Delete ' + name + '?')) return;
-  const el = document.querySelector('#delete-trigger textarea');
-  if (el) { el.value = name; el.dispatchEvent(new Event('input', {bubbles:true})); }
+  fetch('/gradio_api/delete_output', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name})
+  });
+  // Remove card from DOM immediately
+  const card = document.querySelector('.out-card[data-path="' + name + '"]');
+  if (card) card.remove();
 }
 function clearSelections() {
   document.querySelectorAll('.out-card.selected').forEach(c => {
@@ -1096,11 +1101,26 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
     edit_key_btn.click(lambda: gr.update(visible=True), None, api_key)
 
 if __name__ == "__main__":
-    demo.queue().launch(
-        server_name="0.0.0.0",
-        server_port=3000,
-        share=False,
-        allowed_paths=[str(OUTPUT_DIR)],
-        css=CSS,
-        theme=gr.themes.Soft(),
-    )
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    import uvicorn
+
+    app = FastAPI()
+
+    @app.post("/gradio_api/delete_output")
+    async def api_delete_output(request: Request):
+        data = await request.json()
+        name = (data.get("name") or "").strip()
+        if not name or ".." in name or "/" in name:
+            return JSONResponse({"error": "invalid"}, status_code=400)
+        target = OUTPUT_DIR / name
+        if target.exists() and target.is_file():
+            target.unlink()
+            _meta_cache.pop(str(target), None)
+            return JSONResponse({"status": "deleted"})
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    demo.queue()
+    app = gr.mount_gradio_app(app, demo, path="/",
+                               allowed_paths=[str(OUTPUT_DIR)])
+    uvicorn.run(app, host="0.0.0.0", port=3000)
