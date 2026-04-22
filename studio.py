@@ -818,7 +818,7 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
         # Left: chat (60%)
         with gr.Column(scale=3, min_width=400):
             with gr.Row():
-                gr.Markdown("### Studio", scale=3)
+                gr.Markdown("### Studio")
                 model_pick = gr.Dropdown(
                     choices=MODEL_CHOICES, value=DEFAULT_MODEL, label="Model",
                     filterable=True, allow_custom_value=True, scale=4,
