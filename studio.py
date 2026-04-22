@@ -1515,6 +1515,200 @@ if __name__ == "__main__":
             return JSONResponse({"status": "deleted"})
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    # ---- Model merge + LoRA bake-in ----
+
+    @app.post("/api/merge")
+    async def api_merge(request: Request):
+        """Merge SDXL checkpoints with weighted block averaging, optionally bake in LoRAs.
+
+        Params:
+            models: list of {"path": "filename.safetensors", "weight": 0.0-1.0}
+                    First model is the base. Weights are relative (auto-normalized).
+            loras: optional list of {"path": "filename.safetensors", "weight": 0.0-1.0}
+                   LoRAs to bake into the merged result.
+            output_name: filename for the merged checkpoint (saved to checkpoints/)
+            test_prompt: optional prompt to generate a test image with the merged model
+        """
+        import safetensors.torch as st_torch
+        import torch
+        import time as _time
+
+        data = await request.json()
+        models = data.get("models", [])
+        loras = data.get("loras", [])
+        output_name = data.get("output_name", "merged_custom.safetensors")
+        test_prompt = data.get("test_prompt", "")
+
+        if len(models) < 2:
+            return JSONResponse({"error": "Need at least 2 models to merge"}, status_code=400)
+
+        if not output_name.endswith(".safetensors"):
+            output_name += ".safetensors"
+
+        t0 = _time.monotonic()
+        ckpt_dir = MODELS_DIR / "checkpoints"
+        lora_dir = MODELS_DIR / "loras"
+
+        # Validate all files exist
+        for m in models:
+            p = ckpt_dir / m["path"]
+            if not p.exists():
+                return JSONResponse({"error": f"Checkpoint not found: {m['path']}"}, status_code=404)
+        for l in loras:
+            p = lora_dir / l["path"]
+            if not p.exists():
+                return JSONResponse({"error": f"LoRA not found: {l['path']}"}, status_code=404)
+
+        # Normalize weights
+        total_w = sum(m.get("weight", 1.0) for m in models)
+        norm_weights = [m.get("weight", 1.0) / total_w for m in models]
+
+        # Load and merge checkpoints
+        merged = None
+        merge_info = []
+        for i, m in enumerate(models):
+            w = norm_weights[i]
+            path = str(ckpt_dir / m["path"])
+            merge_info.append({"model": m["path"], "weight": round(w, 4)})
+
+            sd = st_torch.load_file(path)
+            if merged is None:
+                merged = {k: v.float() * w for k, v in sd.items()}
+            else:
+                for k, v in sd.items():
+                    if k in merged:
+                        merged[k] += v.float() * w
+                    # Keys only in this model get added at full weight portion
+            del sd
+            torch.cuda.empty_cache()
+
+        # Bake in LoRAs
+        lora_info = []
+        for l in loras:
+            lora_w = l.get("weight", 0.5)
+            path = str(lora_dir / l["path"])
+            lora_info.append({"lora": l["path"], "weight": lora_w})
+
+            lora_sd = st_torch.load_file(path)
+            # LoRA keys follow pattern: lora_unet_xxx.lora_down/up.weight
+            # Apply: merged_weight += lora_up @ lora_down * scale * weight
+            applied = 0
+            pairs = {}
+            for k in lora_sd:
+                if ".lora_down." in k:
+                    base = k.replace(".lora_down.", ".lora_up.")
+                    if base in lora_sd:
+                        pairs[k] = base
+
+            for down_key, up_key in pairs.items():
+                # Derive the target key in the checkpoint
+                # lora_unet_down_blocks_0_attentions_0_... → model.diffusion_model.down_blocks.0.attentions.0...
+                target_key = down_key.split(".lora_down.")[0]
+                target_key = target_key.replace("lora_unet_", "model.diffusion_model.")
+                target_key = target_key.replace("lora_te_", "conditioner.embedders.0.transformer.")
+                target_key = target_key.replace("lora_te1_", "conditioner.embedders.0.transformer.")
+                target_key = target_key.replace("lora_te2_", "conditioner.embedders.1.transformer.")
+                # Convert underscores back to dots for nested keys
+                # But only between segments, not within layer names
+                parts = target_key.split("_")
+                # Reconstruct with dots where appropriate
+                reconstructed = []
+                i = 0
+                while i < len(parts):
+                    # Numbers stay as-is (block indices)
+                    if parts[i].isdigit() and reconstructed:
+                        reconstructed[-1] += "." + parts[i]
+                    else:
+                        reconstructed.append(parts[i])
+                    i += 1
+                target_key = ".".join(reconstructed) + ".weight"
+
+                if target_key in merged:
+                    down = lora_sd[down_key].float()
+                    up = lora_sd[up_key].float()
+                    # LoRA: delta = up @ down * scale
+                    if len(down.shape) == 2 and len(up.shape) == 2:
+                        delta = up @ down * lora_w
+                    elif len(down.shape) == 4:
+                        # Conv layers
+                        delta = torch.nn.functional.conv2d(
+                            down.permute(1, 0, 2, 3), up
+                        ).permute(1, 0, 2, 3) * lora_w
+                    else:
+                        continue
+                    if delta.shape == merged[target_key].shape:
+                        merged[target_key] += delta
+                        applied += 1
+
+            lora_info[-1]["keys_applied"] = applied
+            del lora_sd
+            torch.cuda.empty_cache()
+
+        # Convert back to fp16 for storage efficiency
+        for k in merged:
+            merged[k] = merged[k].half()
+
+        # Save
+        output_path = ckpt_dir / output_name
+        st_torch.save_file(merged, str(output_path))
+        size_gb = output_path.stat().st_size / 1e9
+
+        del merged
+        torch.cuda.empty_cache()
+
+        elapsed = round(_time.monotonic() - t0, 1)
+
+        result = {
+            "output": output_name,
+            "size_gb": round(size_gb, 2),
+            "elapsed_s": elapsed,
+            "merge": merge_info,
+            "loras_baked": lora_info,
+        }
+
+        # Optional: generate a test image with the new checkpoint
+        if test_prompt:
+            import random
+            has_refs = False
+            pos, neg = _optimize_prompt(test_prompt, output_name, has_refs)
+            seed = random.randint(1, 9999999)
+            workflow = {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": output_name}},
+                "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
+                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
+                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+                "5": {"class_type": "KSampler", "inputs": {
+                    "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
+                    "scheduler": "normal", "denoise": 1,
+                    "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+                    "latent_image": ["4", 0]
+                }},
+                "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+                "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": "merge_test", "images": ["6", 0]}},
+            }
+            files, err = _submit_and_wait(workflow, timeout=120)
+            if files:
+                result["test_image"] = files[0]
+                # Review it
+                img_path = OUTPUT_DIR / files[0]
+                if img_path.exists():
+                    review = t_review_image(str(img_path), focus="overall quality, anatomy, style")
+                    result["test_rating"] = review.get("rating")
+                    result["test_review"] = review.get("strengths", "")
+
+        return JSONResponse(result)
+
+    @app.get("/api/merge/models")
+    async def api_merge_list():
+        """List available checkpoints and LoRAs for merging."""
+        ckpt_dir = MODELS_DIR / "checkpoints"
+        lora_dir = MODELS_DIR / "loras"
+        checkpoints = sorted([f.name for f in ckpt_dir.iterdir()
+                              if f.suffix == ".safetensors" and f.name != "put_checkpoints_here"])
+        loras = sorted([f.name for f in lora_dir.iterdir()
+                        if f.suffix == ".safetensors" and f.name != "put_loras_here"])
+        return JSONResponse({"checkpoints": checkpoints, "loras": loras})
+
     # ---- Calibration helpers ----
 
     CALIBRATION_DIR = OUTPUT_DIR / "calibration_profiles"
