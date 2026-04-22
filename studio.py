@@ -518,6 +518,57 @@ def t_review_image(image_path, focus="overall quality, composition, and style"):
         return {"error": f"Vision review failed: {e}"}
 
 
+WORKFLOWS_DIR = Path("/workspace/workflows")
+
+def t_list_workflows():
+    """List available reference workflow JSONs (Daxamur Wan 2.2 etc)."""
+    if not WORKFLOWS_DIR.exists():
+        # Pull from Spaces on first call
+        bucket = os.environ.get("COMFY_S3_BUCKET", "imagination-models")
+        endpoint = os.environ.get("COMFY_S3_ENDPOINT", "https://sfo3.digitaloceanspaces.com")
+        ak = os.environ.get("COMFY_S3_ACCESS_KEY") or os.environ.get("AWS_ACCESS_KEY_ID", "")
+        sk = os.environ.get("COMFY_S3_SECRET_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+        if ak and sk:
+            WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+            cmd = f's5cmd --endpoint-url {endpoint} sync "s3://{bucket}/workflows/*" {WORKFLOWS_DIR}/'
+            subprocess.run(cmd, shell=True, timeout=30)
+    if not WORKFLOWS_DIR.exists():
+        return {"error": "No workflows directory. S3 creds may be missing."}
+    result = []
+    for p in sorted(WORKFLOWS_DIR.rglob("*.json")):
+        result.append({"name": p.name, "path": str(p), "size_kb": round(p.stat().st_size / 1024)})
+    return result
+
+def t_load_workflow(path):
+    """Load a workflow JSON and return its node structure. Use this to understand
+    how a workflow is built before adapting it for your own generation."""
+    p = Path(path)
+    if not p.exists():
+        # Try relative to workflows dir
+        p = WORKFLOWS_DIR / path
+    if not p.exists():
+        return {"error": f"Not found: {path}"}
+    data = json.loads(p.read_text())
+    # Extract key info: prompts, models, dimensions
+    summary = {"total_nodes": len(data) if isinstance(data, dict) else "?"}
+    if isinstance(data, dict):
+        for nid, node in data.items():
+            ct = node.get("class_type", "")
+            inp = node.get("inputs", {})
+            if ct == "CLIPTextEncode" and inp.get("text"):
+                summary.setdefault("prompts", []).append({"node": nid, "text": inp["text"][:200]})
+            elif "Loader" in ct and inp.get("ckpt_name"):
+                summary["checkpoint"] = inp["ckpt_name"]
+            elif ct == "LoraLoader" and inp.get("lora_name"):
+                summary.setdefault("loras", []).append(inp["lora_name"])
+            elif "EmptyLatentImage" in ct or "LatentImage" in ct:
+                if inp.get("width"):
+                    summary["resolution"] = f"{inp.get('width')}x{inp.get('height')}"
+            elif "KSampler" in ct:
+                summary["sampler"] = {k: inp[k] for k in ["steps", "cfg", "sampler_name", "scheduler", "denoise"] if k in inp}
+    summary["full_workflow"] = data
+    return summary
+
 TOOL_FNS = {
     "queue_workflow": t_queue_workflow,
     "get_queue_status": t_get_queue_status,
@@ -535,6 +586,8 @@ TOOL_FNS = {
     "get_lora_details": t_get_lora_details,
     "list_checkpoints": t_list_checkpoints,
     "review_image": t_review_image,
+    "list_workflows": t_list_workflows,
+    "load_workflow": t_load_workflow,
 }
 
 # ---- Tool schemas (OpenAI function-calling) ----
@@ -646,6 +699,18 @@ TOOLS = [
             "image_path": {"type": "string", "description": "Path to the image file (can be relative to output dir, e.g. 'ComfyUI_00042_.png')"},
             "focus": {"type": "string", "description": "What to focus on in the review (e.g. 'character consistency', 'lighting quality', 'overall composition'). Default: general quality."},
         }, "required": ["image_path"]}
+    }},
+    {"type": "function", "function": {
+        "name": "list_workflows",
+        "description": "List available reference workflow JSONs (Daxamur Wan 2.2 T2V/I2V/FLF2V etc). These are production-tested ComfyUI workflows you can study and adapt. Pull from Spaces on first call.",
+        "parameters": {"type": "object", "properties": {}}
+    }},
+    {"type": "function", "function": {
+        "name": "load_workflow",
+        "description": "Load a reference workflow JSON and return its structure — prompts, checkpoint, LoRAs, sampler settings, resolution, and the full node graph. Use this to understand how a proven workflow is built before adapting it for your own generation. Pass the path from list_workflows.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the workflow JSON file"},
+        }, "required": ["path"]}
     }},
 ]
 
