@@ -937,11 +937,80 @@ def _extract_png_meta(path):
                 if not positive or len(txt) > len(positive):
                     positive = txt
 
-        return {"positive": positive, "negative": negative,
-                "checkpoint": checkpoint, "loras": loras,
-                "sampler": sampler, "resolution": resolution}
+        if positive or negative or checkpoint:
+            return {"positive": positive, "negative": negative,
+                    "checkpoint": checkpoint, "loras": loras,
+                    "sampler": sampler, "resolution": resolution}
+
+        # Fallback: A1111/Forge "parameters" format (used by CivitAI images)
+        params_str = img.info.get("parameters", "")
+        if params_str:
+            return _parse_a1111_params(params_str)
+
+        return None
     except Exception:
         return None
+
+
+def _parse_a1111_params(params_str):
+    """Parse A1111/Forge 'parameters' PNG metadata into our standard format."""
+    import re as _re
+    lines = params_str.strip().split("\n")
+    positive = ""
+    negative = ""
+    checkpoint = ""
+    loras = []
+    sampler = {}
+    resolution = ""
+
+    # First line(s) before "Negative prompt:" are the positive prompt
+    # Lines after "Negative prompt:" until the settings line are negative
+    # Last line with "Steps: N, Sampler: ..." is the settings
+    pos_parts = []
+    neg_parts = []
+    settings_line = ""
+    in_negative = False
+
+    for line in lines:
+        if line.startswith("Negative prompt:"):
+            in_negative = True
+            neg_parts.append(line[len("Negative prompt:"):].strip())
+        elif _re.match(r'^Steps:\s*\d', line):
+            settings_line = line
+        elif in_negative:
+            neg_parts.append(line.strip())
+        else:
+            pos_parts.append(line.strip())
+
+    positive = " ".join(pos_parts).strip()
+    negative = " ".join(neg_parts).strip()
+
+    # Extract LoRAs from prompt text: <lora:name:weight>
+    for m in _re.finditer(r'<lora:([^:>]+):([^>]+)>', positive):
+        loras.append(f"{m.group(1)} ({m.group(2)})")
+    # Clean LoRA tags from prompt text
+    positive = _re.sub(r',?\s*<lora:[^>]+>', '', positive).strip().rstrip(',').strip()
+
+    # Parse settings line
+    if settings_line:
+        for kv in settings_line.split(","):
+            kv = kv.strip()
+            if ":" in kv:
+                k, v = kv.split(":", 1)
+                k, v = k.strip(), v.strip()
+                if k == "Steps": sampler["steps"] = int(v)
+                elif k == "Sampler": sampler["sampler_name"] = v
+                elif k == "Schedule type": sampler["scheduler"] = v
+                elif k == "CFG scale": sampler["cfg"] = float(v)
+                elif k == "Seed": sampler["seed"] = int(v)
+                elif k == "Size":
+                    resolution = v
+                elif k == "Model":
+                    checkpoint = v
+
+    return {"positive": positive, "negative": negative,
+            "checkpoint": checkpoint, "loras": loras,
+            "sampler": sampler, "resolution": resolution}
 
 # Cache metadata to avoid re-reading PNGs on every 4s refresh
 _meta_cache = {}
