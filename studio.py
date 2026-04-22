@@ -64,7 +64,8 @@ RULES OF ENGAGEMENT:
      tmux kill-session -t comfyui
      tmux new-session -d -s comfyui 'cd /workspace/ComfyUI && source venv/bin/activate && python main.py --listen 0.0.0.0 --port 8188 2>&1 | tee /workspace/comfy.log'
 7. Introspect if unsure: `curl -s http://127.0.0.1:8188/object_info | python3 -c "import sys,json; d=json.load(sys.stdin); print(list(d)[:50])"`.
-8. Be terse in chat. Tool output is shown separately — don't re-narrate it."""
+8. Be terse in chat. Tool output is shown separately — don't re-narrate it.
+9. REVIEW LOOP: After generating an image, call review_image on it. If the verdict is 'fail' or 'flag' (rating < 7), read the prompt deltas, revise your workflow accordingly, and regenerate. Iterate up to 3 times. If it still fails, show the user what you have and ask for guidance."""
 
 # Grok-specific: stricter template. Grok struggles with open-ended workflow
 # construction, so we hand it an exact skeleton and ask it to substitute.
@@ -290,6 +291,100 @@ def t_list_checkpoints(base_model=""):
     ]
 
 
+def _get_openrouter_key():
+    """Read the persisted OpenRouter API key."""
+    if API_KEY_FILE.exists():
+        return API_KEY_FILE.read_text().strip()
+    return None
+
+VISION_MODEL = "x-ai/grok-4.1-fast"
+
+def t_review_image(image_path, focus="overall quality, composition, and style"):
+    """Send a generated image to Grok vision for quality review.
+
+    Returns a structured verdict: pass/flag/fail with a numeric rating,
+    what works, what doesn't, and specific revision notes for regeneration.
+    """
+    import base64
+    api_key = _get_openrouter_key()
+    if not api_key:
+        return {"error": "No OpenRouter API key set. Enter one in the UI."}
+
+    # Resolve the path — check output dir, workspace, and absolute
+    p = Path(image_path)
+    if not p.is_absolute():
+        candidates = [
+            OUTPUT_DIR / image_path,
+            COMFY_ROOT / image_path,
+            Path("/workspace") / image_path,
+        ]
+        for c in candidates:
+            if c.exists():
+                p = c
+                break
+    if not p.exists():
+        return {"error": f"File not found: {image_path}"}
+    if p.stat().st_size > 10_000_000:
+        return {"error": f"File too large ({p.stat().st_size / 1e6:.1f} MB). Max 10 MB."}
+
+    img_b64 = base64.b64encode(p.read_bytes()).decode()
+    ext = p.suffix.lower().lstrip(".")
+    mime = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+            "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/png")
+
+    system_text = (
+        "You are a film director reviewing a generated image.\n"
+        f"Focus: {focus}\n\n"
+        "Respond with ONLY a JSON object (no markdown, no extra text):\n"
+        '{"rating": 1-10, "verdict": "pass|flag|fail", '
+        '"strengths": "what works well", '
+        '"weaknesses": "what needs improvement", '
+        '"positive_prompt_delta": "what to add or keep in the prompt", '
+        '"negative_prompt_delta": "what to remove or avoid in the prompt", '
+        '"recommendation": "approve|iterate|rethink"}\n\n'
+        "Rating guide: 7+ = pass, 4-6 = flag (fixable issues), 1-3 = fail (start over)."
+    )
+
+    try:
+        client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+        resp = client.chat.completions.create(
+            model=VISION_MODEL,
+            max_tokens=500,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{img_b64}"}},
+                {"type": "text", "text": system_text},
+            ]}],
+        )
+        review_text = resp.choices[0].message.content or ""
+
+        # Parse structured verdict
+        import re as _re
+        try:
+            verdict = json.loads(review_text)
+        except json.JSONDecodeError:
+            m = _re.search(r'\{.*\}', review_text, _re.DOTALL)
+            if m:
+                try:
+                    verdict = json.loads(m.group(0))
+                except json.JSONDecodeError:
+                    verdict = None
+            else:
+                verdict = None
+
+        if not verdict or not isinstance(verdict, dict):
+            verdict = {"rating": 5, "verdict": "flag", "raw_review": review_text,
+                        "recommendation": "iterate"}
+
+        verdict.setdefault("rating", 5)
+        verdict.setdefault("verdict", "flag" if verdict["rating"] < 7 else "pass")
+        verdict["image_path"] = image_path
+        verdict["focus"] = focus
+        return verdict
+
+    except Exception as e:
+        return {"error": f"Vision review failed: {e}"}
+
+
 TOOL_FNS = {
     "queue_workflow": t_queue_workflow,
     "get_queue_status": t_get_queue_status,
@@ -305,6 +400,7 @@ TOOL_FNS = {
     "search_library": t_search_library,
     "get_lora_details": t_get_lora_details,
     "list_checkpoints": t_list_checkpoints,
+    "review_image": t_review_image,
 }
 
 # ---- Tool schemas (OpenAI function-calling) ----
@@ -401,6 +497,14 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "base_model": {"type": "string", "description": "Filter: SDXL, Flux, SD1.5, Pony. Omit for all."},
         }}
+    }},
+    {"type": "function", "function": {
+        "name": "review_image",
+        "description": "Send a generated image to Grok vision for quality review. Returns a structured verdict (pass/flag/fail) with a 1-10 rating, strengths, weaknesses, and specific prompt revision notes. Use after generating an image to check quality. If verdict is 'fail' or 'flag', use the prompt deltas to revise your workflow and regenerate. Iterate up to 3 times.",
+        "parameters": {"type": "object", "properties": {
+            "image_path": {"type": "string", "description": "Path to the image file (can be relative to output dir, e.g. 'ComfyUI_00042_.png')"},
+            "focus": {"type": "string", "description": "What to focus on in the review (e.g. 'character consistency', 'lighting quality', 'overall composition'). Default: general quality."},
+        }, "required": ["image_path"]}
     }},
 ]
 
