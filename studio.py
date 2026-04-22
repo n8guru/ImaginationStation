@@ -1466,37 +1466,52 @@ if __name__ == "__main__":
 
     @app.post("/api/generate")
     async def api_generate(request: Request):
-        """Bridge endpoint: accepts a description, builds a ComfyUI workflow,
-        generates the image, optionally reviews it, returns the result.
-        Called by the droplet's freestyle director via request_image tool."""
+        """Bridge endpoint: text-to-image or reference-image-to-image generation.
+
+        Params:
+            description (str): positive prompt
+            filename_prefix (str): output filename prefix
+            reference_image (str, optional): path to reference image on this instance
+                OR a URL to download. Triggers IPAdapter workflow.
+            reference_image_data (str, optional): base64-encoded image data
+            reference_weight (float, optional): IPAdapter strength 0-1, default 0.8
+        """
         data = await request.json()
         description = (data.get("description") or "").strip()
         filename_prefix = data.get("filename_prefix", "gen")
+        # reference_images: list of paths/URLs, or single string for backward compat
+        ref_images_raw = data.get("reference_images", [])
+        if not ref_images_raw:
+            single = data.get("reference_image", "")
+            if single:
+                ref_images_raw = [single]
+        ref_image_data = data.get("reference_image_data", "")
+        ref_weight = float(data.get("reference_weight", 0.8))
+
         if not description:
             return JSONResponse({"error": "description is required"}, status_code=400)
 
-        # Build a simple SDXL workflow using BigLove Ultra5 (or best available checkpoint)
         import time as _time
+        import random
+        import httpx
         t0 = _time.monotonic()
 
         # Find best checkpoint on disk
-        ckpt = "bigLove_ultra5.safetensors"  # default
+        ckpt = "bigLove_ultra5.safetensors"
         ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
         if ckpt_dir.exists():
             available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
-            # Prefer BigLove, then SDXL, then anything
             for pref in ["bigLove", "sdxl", "analXL", "dreamshaper"]:
                 match = [a for a in available if pref.lower() in a.lower()]
                 if match:
                     ckpt = match[0]
                     break
 
-        import random
         seed = random.randint(1, 9999999)
 
         # Apply prompt engineering rules
         pos = description
-        if not any(tag in pos.lower() for tag in ["1girl", "1boy", "1woman", "1man", "solo", "2people"]):
+        if not any(tag in pos.lower() for tag in ["1girl", "1boy", "1woman", "1man", "solo", "2people", "couple"]):
             pos = "1girl, solo, " + pos
 
         neg = ("multiple people, duplicate, clone, crowd, extra person, extra face, "
@@ -1504,23 +1519,110 @@ if __name__ == "__main__":
                "bad anatomy, deformed, disfigured, mutation, worst quality, "
                "low quality, blurry, watermark, text")
 
-        workflow = {
-            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
-            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
-            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
-            "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
-            "5": {"class_type": "KSampler", "inputs": {
+        # Handle reference images — download URLs or resolve local paths
+        ref_local_paths = []
+
+        for i, ref in enumerate(ref_images_raw):
+            if not ref:
+                continue
+            if ref.startswith("http"):
+                try:
+                    dl = httpx.get(ref, timeout=30, follow_redirects=True)
+                    dl.raise_for_status()
+                    local = str(OUTPUT_DIR / f"_ref_{filename_prefix}_{i}.png")
+                    Path(local).write_bytes(dl.content)
+                    ref_local_paths.append(local)
+                except Exception as e:
+                    pass  # skip failed downloads, don't abort
+            elif Path(ref).exists():
+                ref_local_paths.append(ref)
+            elif (OUTPUT_DIR / ref).exists():
+                ref_local_paths.append(str(OUTPUT_DIR / ref))
+
+        if ref_image_data:
+            import base64
+            try:
+                img_bytes = base64.b64decode(ref_image_data)
+                local = str(OUTPUT_DIR / f"_ref_{filename_prefix}_b64.png")
+                Path(local).write_bytes(img_bytes)
+                ref_local_paths.append(local)
+            except Exception:
+                pass
+
+        # Build workflow — IPAdapter if reference images, plain txt2img otherwise
+        if ref_local_paths:
+            import shutil
+            input_dir = COMFY_ROOT / "input"
+            input_dir.mkdir(exist_ok=True)
+
+            # Copy all ref images to ComfyUI input dir
+            ref_names = []
+            for rp in ref_local_paths:
+                name = Path(rp).name
+                shutil.copy2(rp, str(input_dir / name))
+                ref_names.append(name)
+
+            # Base workflow with IPAdapter
+            workflow = {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+                "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
+                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
+                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+                "11": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip-vit-large-patch14.safetensors"}},
+                "13": {"class_type": "IPAdapterModelLoader", "inputs": {
+                    "ipadapter_file": "ip-adapter-plus_sdxl_vit-h.safetensors"
+                }},
+            }
+
+            # Chain IPAdapter nodes — each reference image adds conditioning
+            prev_model = "1"  # start from checkpoint output
+            for i, ref_name in enumerate(ref_names):
+                load_id = str(20 + i * 2)
+                ipa_id = str(21 + i * 2)
+                # Per-image weight: distribute evenly, or full weight for single
+                w = ref_weight if len(ref_names) == 1 else ref_weight / len(ref_names)
+
+                workflow[load_id] = {"class_type": "LoadImage", "inputs": {"image": ref_name}}
+                workflow[ipa_id] = {"class_type": "IPAdapterAdvanced", "inputs": {
+                    "weight": round(w, 2),
+                    "weight_type": "linear",
+                    "start_at": 0.0,
+                    "end_at": 1.0,
+                    "model": [prev_model, 0],
+                    "ipadapter": ["13", 0],
+                    "image": [load_id, 0],
+                    "clip_vision": ["11", 0],
+                }}
+                prev_model = ipa_id
+
+            # KSampler uses the last IPAdapter output as model
+            workflow["5"] = {"class_type": "KSampler", "inputs": {
                 "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
                 "scheduler": "normal", "denoise": 1,
-                "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]
-            }},
-            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
-            "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}},
-        }
+                "model": [prev_model, 0], "positive": ["2", 0], "negative": ["3", 0],
+                "latent_image": ["4", 0]
+            }}
+            workflow["6"] = {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}}
+            workflow["7"] = {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}}
+        else:
+            # Plain text-to-image
+            workflow = {
+                "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+                "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
+                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
+                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+                "5": {"class_type": "KSampler", "inputs": {
+                    "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
+                    "scheduler": "normal", "denoise": 1,
+                    "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+                    "latent_image": ["4", 0]
+                }},
+                "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+                "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}},
+            }
 
         # Submit to ComfyUI
         try:
-            import httpx
             resp = httpx.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
             if resp.status_code != 200:
                 return JSONResponse({"error": f"ComfyUI rejected: {resp.text[:500]}"}, status_code=500)
@@ -1529,7 +1631,7 @@ if __name__ == "__main__":
             return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
 
         # Poll for completion
-        deadline = _time.monotonic() + 300  # 5 min max
+        deadline = _time.monotonic() + 300
         files = []
         while _time.monotonic() < deadline:
             _time.sleep(2)
@@ -1550,21 +1652,22 @@ if __name__ == "__main__":
                 pass
 
         elapsed = round(_time.monotonic() - t0, 1)
-
         if not files:
             return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
 
         # Run review on first image
         review = {}
-        if files:
-            img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
-            if img_path.exists():
-                review = t_review_image(str(img_path), focus="prompt adherence, anatomy, character count")
+        img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
+        if img_path.exists():
+            review = t_review_image(str(img_path), focus="prompt adherence, anatomy, character count")
 
         return JSONResponse({
             "files": files,
             "prompt_id": prompt_id,
             "checkpoint": ckpt,
+            "has_reference": bool(ref_local_paths),
+            "reference_count": len(ref_local_paths),
+            "reference_weight": ref_weight if ref_local_paths else None,
             "elapsed_s": elapsed,
             "review_status": review.get("verdict", "unknown"),
             "rating": review.get("rating"),
