@@ -1570,6 +1570,17 @@ if __name__ == "__main__":
                "bad anatomy, deformed, disfigured, mutation, worst quality, "
                "low quality, blurry, watermark, text")
 
+        # When reference images are used and prompt suggests nudity,
+        # reinforce clothing removal in negative prompt to fight reference bleed
+        if ref_images_raw or ref_image_data:
+            nude_keywords = ["nude", "naked", "topless", "undress", "strip",
+                             "nsfw", "explicit", "pussy", "penis", "breast",
+                             "nipple", "genital", "erect", "ass", "anal"]
+            if any(kw in pos.lower() for kw in nude_keywords):
+                neg += (", clothing, clothes, dressed, shirt, pants, skirt, dress, "
+                        "bra, underwear, panties, fabric, textile, garment, outfit, "
+                        "wearing clothes, partially clothed, covered")
+
         # Handle reference images — download URLs or resolve local paths
         ref_local_paths = []
 
