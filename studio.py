@@ -540,33 +540,99 @@ def t_list_workflows():
     return result
 
 def t_load_workflow(path):
-    """Load a workflow JSON and return its node structure. Use this to understand
-    how a workflow is built before adapting it for your own generation."""
+    """Load a workflow JSON and return its structure. Works with both ComfyUI
+    API format (node_id→node dict) and UI format (nodes+links arrays).
+    Returns a summary of models, prompts, settings, and node types used."""
     p = Path(path)
     if not p.exists():
-        # Try relative to workflows dir
         p = WORKFLOWS_DIR / path
     if not p.exists():
         return {"error": f"Not found: {path}"}
     data = json.loads(p.read_text())
-    # Extract key info: prompts, models, dimensions
-    summary = {"total_nodes": len(data) if isinstance(data, dict) else "?"}
-    if isinstance(data, dict):
-        for nid, node in data.items():
-            ct = node.get("class_type", "")
-            inp = node.get("inputs", {})
-            if ct == "CLIPTextEncode" and inp.get("text"):
-                summary.setdefault("prompts", []).append({"node": nid, "text": inp["text"][:200]})
-            elif "Loader" in ct and inp.get("ckpt_name"):
-                summary["checkpoint"] = inp["ckpt_name"]
-            elif ct == "LoraLoader" and inp.get("lora_name"):
-                summary.setdefault("loras", []).append(inp["lora_name"])
-            elif "EmptyLatentImage" in ct or "LatentImage" in ct:
-                if inp.get("width"):
-                    summary["resolution"] = f"{inp.get('width')}x{inp.get('height')}"
-            elif "KSampler" in ct:
-                summary["sampler"] = {k: inp[k] for k in ["steps", "cfg", "sampler_name", "scheduler", "denoise"] if k in inp}
-    summary["full_workflow"] = data
+
+    summary = {}
+
+    # Detect format
+    if "nodes" in data and "links" in data:
+        # UI format — extract useful info from nodes array
+        nodes = data.get("nodes", [])
+        summary["format"] = "ui"
+        summary["total_nodes"] = len(nodes)
+
+        # Catalog node types and their widget values
+        node_types = {}
+        models_used = []
+        prompts = []
+        samplers = []
+
+        for n in nodes:
+            ntype = n.get("type", "unknown")
+            node_types[ntype] = node_types.get(ntype, 0) + 1
+            widgets = n.get("widgets_values", [])
+
+            # Extract model references
+            if "Loader" in ntype or "Load" in ntype:
+                for w in widgets:
+                    if isinstance(w, str) and w.endswith((".safetensors", ".gguf", ".ckpt")):
+                        models_used.append({"node_type": ntype, "file": w})
+
+            # Extract text prompts
+            if "CLIPText" in ntype or "TextEncode" in ntype or "Text" in ntype:
+                for w in widgets:
+                    if isinstance(w, str) and len(w) > 20:
+                        prompts.append({"node_type": ntype, "node_id": n.get("id"), "text": w[:300]})
+
+            # Extract sampler settings
+            if "KSampler" in ntype or "Sampler" in ntype:
+                sampler_info = {"node_type": ntype}
+                for w in widgets:
+                    if isinstance(w, int) and 1 <= w <= 200:
+                        sampler_info.setdefault("steps_or_seed", []).append(w)
+                    elif isinstance(w, (int, float)) and 0 < w < 30:
+                        sampler_info.setdefault("cfg_or_denoise", []).append(w)
+                    elif isinstance(w, str) and w in ("euler", "euler_a", "dpmpp_2m", "uni_pc", "ddim", "lms"):
+                        sampler_info["sampler_name"] = w
+                    elif isinstance(w, str) and w in ("normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta"):
+                        sampler_info["scheduler"] = w
+                samplers.append(sampler_info)
+
+        summary["node_types"] = dict(sorted(node_types.items(), key=lambda x: -x[1]))
+        summary["models_referenced"] = models_used
+        if prompts:
+            summary["prompts"] = prompts
+        if samplers:
+            summary["samplers"] = samplers
+        summary["note"] = (
+            "This is a UI-format workflow (not directly usable with queue_workflow). "
+            "Use it as a REFERENCE to understand the pipeline structure, then build "
+            "a minimal API-format workflow with the same models and settings. "
+            "A basic Wan 2.2 T2V pipeline needs ~10 nodes: 2x LoadDiffusionModel "
+            "(high+low noise), LoadCLIP (umt5), LoadVAE, CLIPTextEncode (prompt), "
+            "EmptyWanLatentVideo, KSampler (high noise), KSampler (low noise), "
+            "VAEDecode, SaveAnimatedWEBP/SaveVideo."
+        )
+
+    else:
+        # API format — direct summary
+        summary["format"] = "api"
+        summary["total_nodes"] = len(data) if isinstance(data, dict) else "?"
+        if isinstance(data, dict):
+            for nid, node in data.items():
+                ct = node.get("class_type", "")
+                inp = node.get("inputs", {})
+                if ct == "CLIPTextEncode" and inp.get("text"):
+                    summary.setdefault("prompts", []).append({"node": nid, "text": inp["text"][:200]})
+                elif "Loader" in ct and inp.get("ckpt_name"):
+                    summary.setdefault("models", []).append(inp["ckpt_name"])
+                elif ct == "LoraLoader" and inp.get("lora_name"):
+                    summary.setdefault("loras", []).append(inp["lora_name"])
+                elif "EmptyLatentImage" in ct or "LatentImage" in ct:
+                    if inp.get("width"):
+                        summary["resolution"] = f"{inp.get('width')}x{inp.get('height')}"
+                elif "KSampler" in ct:
+                    summary["sampler"] = {k: inp[k] for k in ["steps", "cfg", "sampler_name", "scheduler", "denoise"] if k in inp}
+        summary["full_workflow"] = data
+
     return summary
 
 
