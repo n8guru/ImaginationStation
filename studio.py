@@ -1537,7 +1537,7 @@ if __name__ == "__main__":
             if single:
                 ref_images_raw = [single]
         ref_image_data = data.get("reference_image_data", "")
-        ref_weight = float(data.get("reference_weight", 0.8))
+        ref_weight = float(data.get("reference_weight", 0.5))
 
         if not description:
             return JSONResponse({"error": "description is required"}, status_code=400)
@@ -1639,8 +1639,8 @@ if __name__ == "__main__":
                     "weight_type": "linear",
                     "combine_embeds": "concat",
                     "embeds_scaling": "V only",
-                    "start_at": 0.0,
-                    "end_at": 1.0,
+                    "start_at": 0.15,
+                    "end_at": 0.85,
                     "model": [prev_model, 0],
                     "ipadapter": ["13", 0],
                     "image": [load_id, 0],
