@@ -638,7 +638,7 @@ def dispatch(name, args):
 # ---- Chat loop ----
 MAX_STEPS = 50
 
-def chat(user_msg, display_hist, api_hist, api_key, model):
+def chat(user_msg, display_hist, api_hist, api_key, model, selected_files=""):
     if not user_msg.strip():
         yield "", display_hist, api_hist
         return
@@ -649,6 +649,13 @@ def chat(user_msg, display_hist, api_hist, api_key, model):
         ]
         yield "", display_hist, api_hist
         return
+
+    # Prepend selected image references so the director knows what user is pointing at
+    if selected_files and selected_files.strip():
+        refs = [f.strip() for f in selected_files.strip().split("\n") if f.strip()]
+        if refs:
+            ref_text = "  ".join(refs)
+            user_msg = f"[Reference images: {ref_text}]\n\n{user_msg}"
 
     client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
 
@@ -746,8 +753,9 @@ def chat(user_msg, display_hist, api_hist, api_key, model):
     yield "", display_hist, api_hist
 
 
-# ---- Gallery helpers ----
-def refresh_gallery():
+# ---- Output helpers ----
+def _list_outputs():
+    """Return list of (abs_path, filename) newest first."""
     if not OUTPUT_DIR.exists():
         return []
     files = sorted(
@@ -755,6 +763,58 @@ def refresh_gallery():
         key=lambda p: p.stat().st_mtime, reverse=True,
     )[:60]
     return [(str(p), p.name) for p in files]
+
+def refresh_gallery():
+    return _list_outputs()
+
+def refresh_output_html():
+    """Render output strip as HTML cards with selectable thumbnails."""
+    files = _list_outputs()
+    if not files:
+        return '<div style="color:#888;text-align:center;padding:40px;">No outputs yet</div>'
+    cards = []
+    for path, name in files:
+        cards.append(f'''<div class="out-card" data-path="{name}" onclick="toggleSelect(this)"
+             style="margin-bottom:8px;border:2px solid transparent;border-radius:8px;
+                    padding:4px;cursor:pointer;transition:border-color 0.15s;">
+  <img src="/file={path}" style="width:100%;border-radius:6px;display:block;"
+       onclick="event.stopPropagation();openLightbox(this.src)" loading="lazy">
+  <div style="font-family:monospace;font-size:11px;color:#aaa;padding:4px 2px 0;
+              user-select:all;word-break:break-all;">{name}</div>
+</div>''')
+    return "\n".join(cards)
+
+OUTPUT_STRIP_JS = """
+<script>
+function toggleSelect(card) {
+  card.classList.toggle('selected');
+  card.style.borderColor = card.classList.contains('selected') ? '#4a9eff' : 'transparent';
+  updateSelectedState();
+}
+function updateSelectedState() {
+  const selected = [...document.querySelectorAll('.out-card.selected')].map(c => c.dataset.path);
+  const el = document.querySelector('#selected-files-state textarea');
+  if (el) { el.value = selected.join('\\n'); el.dispatchEvent(new Event('input', {bubbles:true})); }
+}
+function openLightbox(src) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.9);z-index:9999;display:flex;align-items:center;justify-content:center;cursor:zoom-out;';
+  overlay.onclick = () => overlay.remove();
+  const img = document.createElement('img');
+  img.src = src;
+  img.style.cssText = 'max-width:95vw;max-height:95vh;border-radius:8px;';
+  overlay.appendChild(img);
+  document.body.appendChild(overlay);
+}
+function clearSelections() {
+  document.querySelectorAll('.out-card.selected').forEach(c => {
+    c.classList.remove('selected');
+    c.style.borderColor = 'transparent';
+  });
+  updateSelectedState();
+}
+</script>
+"""
 
 def save_key(k):
     if k:
@@ -807,8 +867,9 @@ footer {display:none !important}
 .gradio-container > .main, .gradio-container .contain {max-width: 100% !important; padding: 0 !important;}
 .chatbot {height: calc(100vh - 320px) !important;}
 #comfyframe iframe {width: 100%; height: 800px; border: 1px solid #444; border-radius: 8px;}
-#output-strip {overflow-y: auto; max-height: calc(100vh - 120px);}
-#output-strip .gallery-item {margin-bottom: 4px;}
+#output-strip {overflow-y: auto; max-height: calc(100vh - 100px);}
+#output-html {overflow-y: auto; max-height: calc(100vh - 240px); padding-right: 4px;}
+.out-card.selected {background: rgba(74,158,255,0.1);}
 """
 
 with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
@@ -839,11 +900,12 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
 
         # Right: output strip (40%)
         with gr.Column(scale=2, min_width=300, elem_id="output-strip"):
-            gr.Markdown("### Outputs")
-            gallery = gr.Gallery(value=refresh_gallery(), columns=2,
-                                 height="calc(100vh - 240px)",
-                                 show_label=False, allow_preview=False,
-                                 object_fit="contain")
+            with gr.Row():
+                gr.Markdown("### Outputs")
+                deselect_btn = gr.Button("Clear selection", size="sm", scale=0, min_width=120)
+            output_html = gr.HTML(value=refresh_output_html() + OUTPUT_STRIP_JS,
+                                  elem_id="output-html")
+            selected_state = gr.Textbox(value="", visible=False, elem_id="selected-files-state")
             with gr.Row():
                 refresh_btn = gr.Button("↻ Refresh", size="sm", scale=1)
                 sync_btn = gr.Button("💾 N8Razer", size="sm", scale=1,
@@ -859,17 +921,21 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
         gr.HTML(f'<iframe id="comfyframe" src="{_comfy_url}" allow="clipboard-write"'
                 f' style="width:100%;height:800px;border:1px solid #444;border-radius:8px;"></iframe>')
 
-    # Auto-refresh: poll gallery every 4s while chat is active
-    gallery_timer = gr.Timer(value=4, active=True)
-    gallery_timer.tick(refresh_gallery, None, gallery)
+    def _refresh_html():
+        return refresh_output_html() + OUTPUT_STRIP_JS
+
+    # Auto-refresh: poll outputs every 4s
+    output_timer = gr.Timer(value=4, active=True)
+    output_timer.tick(_refresh_html, None, output_html)
 
     # Wiring
-    send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick],
-                   [msg, chatbot, api_state]).then(refresh_gallery, None, gallery)
-    msg.submit(chat, [msg, chatbot, api_state, api_key, model_pick],
-               [msg, chatbot, api_state]).then(refresh_gallery, None, gallery)
+    send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick, selected_state],
+                   [msg, chatbot, api_state]).then(_refresh_html, None, output_html)
+    msg.submit(chat, [msg, chatbot, api_state, api_key, model_pick, selected_state],
+               [msg, chatbot, api_state]).then(_refresh_html, None, output_html)
     clear_btn.click(lambda: ([], []), None, [chatbot, api_state])
-    refresh_btn.click(refresh_gallery, None, gallery)
+    refresh_btn.click(_refresh_html, None, output_html)
+    deselect_btn.click(lambda: "", None, selected_state, js="() => { clearSelections(); }")
     sync_btn.click(sync_to_n8razer, None, sync_status)
     api_key.change(save_key, api_key, None)
     edit_key_btn.click(lambda: gr.update(visible=True), None, api_key)
