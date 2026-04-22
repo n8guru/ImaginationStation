@@ -993,8 +993,9 @@ def _list_outputs():
     """Return list of (abs_path, filename) newest first."""
     if not OUTPUT_DIR.exists():
         return []
+    _MEDIA_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm", ".gif")
     files = sorted(
-        [p for p in OUTPUT_DIR.rglob("*") if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")],
+        [p for p in OUTPUT_DIR.rglob("*") if p.suffix.lower() in _MEDIA_EXTS],
         key=lambda p: p.stat().st_mtime, reverse=True,
     )[:60]
     return [(str(p), p.name) for p in files]
@@ -1171,11 +1172,18 @@ def refresh_output_html():
   <div style="font-size:10px;color:#999;padding:4px 0 2px;line-height:1.5;user-select:all;">{"<br>".join(parts)}</div>
 </details>'''
 
+        is_video = Path(name).suffix.lower() in (".mp4", ".webm", ".gif")
+        if is_video:
+            media_html = f'''<video src="/gradio_api/file={path}" style="width:100%;border-radius:6px;display:block;"
+       controls preload="metadata" onclick="event.stopPropagation()"></video>'''
+        else:
+            media_html = f'''<img src="/gradio_api/file={path}" style="width:100%;border-radius:6px;display:block;"
+       onclick="event.stopPropagation();openLightbox(this.src)" loading="lazy">'''
+
         cards.append(f'''<div class="out-card" data-path="{name}" onclick="toggleSelect(this)"
              style="margin-bottom:10px;border:2px solid transparent;border-radius:8px;
                     padding:4px;cursor:pointer;transition:border-color 0.15s;">
-  <img src="/gradio_api/file={path}" style="width:100%;border-radius:6px;display:block;"
-       onclick="event.stopPropagation();openLightbox(this.src)" loading="lazy">
+  {media_html}
   <div style="display:flex;align-items:center;gap:4px;padding:3px 2px 0;">
     <input type="checkbox" class="out-check" onclick="event.stopPropagation();toggleSelect(this.closest('.out-card'))"
            style="margin:0;flex-shrink:0;accent-color:#4a9eff;">
