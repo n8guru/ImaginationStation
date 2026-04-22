@@ -1589,6 +1589,9 @@ if __name__ == "__main__":
         # Bake in LoRAs using ComfyUI's own loader (handles key format conversion)
         lora_info = []
         if loras:
+            import sys
+            if str(COMFY_ROOT) not in sys.path:
+                sys.path.insert(0, str(COMFY_ROOT))
             import comfy.sd
             import comfy.utils
 
