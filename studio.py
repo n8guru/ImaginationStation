@@ -569,6 +569,49 @@ def t_load_workflow(path):
     summary["full_workflow"] = data
     return summary
 
+
+def t_save_workflow(name, workflow, notes=""):
+    """Save a working workflow as a named template for reuse. The workflow
+    argument should be the exact node dict you'd pass to queue_workflow.
+    Saved to /workspace/workflows/saved/ and backed up to DO Spaces."""
+    WORKFLOWS_DIR.mkdir(parents=True, exist_ok=True)
+    saved_dir = WORKFLOWS_DIR / "saved"
+    saved_dir.mkdir(exist_ok=True)
+
+    # Sanitize name
+    safe_name = "".join(c if c.isalnum() or c in "-_ " else "" for c in name).strip().replace(" ", "_")
+    if not safe_name:
+        return {"error": "Invalid name"}
+    filename = f"{safe_name}.json"
+    path = saved_dir / filename
+
+    # Save with metadata wrapper
+    data = {
+        "name": name,
+        "notes": notes,
+        "saved_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "workflow": workflow,
+    }
+    path.write_text(json.dumps(data, indent=2))
+
+    # Backup to DO Spaces
+    bucket = os.environ.get("COMFY_S3_BUCKET", "imagination-models")
+    endpoint = os.environ.get("COMFY_S3_ENDPOINT", "https://sfo3.digitaloceanspaces.com")
+    ak = os.environ.get("COMFY_S3_ACCESS_KEY", "")
+    sk = os.environ.get("COMFY_S3_SECRET_KEY", "")
+    if ak and sk:
+        try:
+            import subprocess
+            spaces_key = f"workflows/saved/{filename}"
+            subprocess.run([
+                "s5cmd", "--endpoint-url", endpoint,
+                "cp", str(path), f"s3://{bucket}/{spaces_key}"
+            ], timeout=15, capture_output=True)
+        except Exception:
+            pass  # local save succeeded, S3 backup is best-effort
+
+    return {"status": "saved", "name": name, "path": str(path), "filename": filename}
+
 TOOL_FNS = {
     "queue_workflow": t_queue_workflow,
     "get_queue_status": t_get_queue_status,
@@ -588,6 +631,7 @@ TOOL_FNS = {
     "review_image": t_review_image,
     "list_workflows": t_list_workflows,
     "load_workflow": t_load_workflow,
+    "save_workflow": t_save_workflow,
 }
 
 # ---- Tool schemas (OpenAI function-calling) ----
@@ -711,6 +755,15 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "Path to the workflow JSON file"},
         }, "required": ["path"]}
+    }},
+    {"type": "function", "function": {
+        "name": "save_workflow",
+        "description": "Save a working workflow as a named template for reuse. After you've built and tested a workflow that produces good results, save it so you (or the next session) can load it instantly without rebuilding. The workflow is backed up to DO Spaces so it persists across GPU instances.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Human-readable name (e.g. 'SDXL BigLove portrait', 'Wan T2V NSFW missionary')"},
+            "workflow": {"type": "object", "description": "The exact node dict — same format you pass to queue_workflow"},
+            "notes": {"type": "string", "description": "Optional notes: what models/LoRAs it uses, recommended prompts, settings tips"},
+        }, "required": ["name", "workflow"]}
     }},
 ]
 
