@@ -1464,6 +1464,124 @@ if __name__ == "__main__":
             return JSONResponse({"status": "deleted"})
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    @app.post("/api/generate")
+    async def api_generate(request: Request):
+        """Bridge endpoint: accepts a description, builds a ComfyUI workflow,
+        generates the image, optionally reviews it, returns the result.
+        Called by the droplet's freestyle director via request_image tool."""
+        data = await request.json()
+        description = (data.get("description") or "").strip()
+        filename_prefix = data.get("filename_prefix", "gen")
+        if not description:
+            return JSONResponse({"error": "description is required"}, status_code=400)
+
+        # Build a simple SDXL workflow using BigLove Ultra5 (or best available checkpoint)
+        import time as _time
+        t0 = _time.monotonic()
+
+        # Find best checkpoint on disk
+        ckpt = "bigLove_ultra5.safetensors"  # default
+        ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
+        if ckpt_dir.exists():
+            available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
+            # Prefer BigLove, then SDXL, then anything
+            for pref in ["bigLove", "sdxl", "analXL", "dreamshaper"]:
+                match = [a for a in available if pref.lower() in a.lower()]
+                if match:
+                    ckpt = match[0]
+                    break
+
+        import random
+        seed = random.randint(1, 9999999)
+
+        # Apply prompt engineering rules
+        pos = description
+        if not any(tag in pos.lower() for tag in ["1girl", "1boy", "1woman", "1man", "solo", "2people"]):
+            pos = "1girl, solo, " + pos
+
+        neg = ("multiple people, duplicate, clone, crowd, extra person, extra face, "
+               "extra body, extra limbs, extra arms, extra hands, extra fingers, "
+               "bad anatomy, deformed, disfigured, mutation, worst quality, "
+               "low quality, blurry, watermark, text")
+
+        workflow = {
+            "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
+            "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "5": {"class_type": "KSampler", "inputs": {
+                "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_a",
+                "scheduler": "normal", "denoise": 1,
+                "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0], "latent_image": ["4", 0]
+            }},
+            "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+            "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}},
+        }
+
+        # Submit to ComfyUI
+        try:
+            import httpx
+            resp = httpx.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
+            if resp.status_code != 200:
+                return JSONResponse({"error": f"ComfyUI rejected: {resp.text[:500]}"}, status_code=500)
+            prompt_id = resp.json().get("prompt_id")
+        except Exception as e:
+            return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
+
+        # Poll for completion
+        deadline = _time.monotonic() + 300  # 5 min max
+        files = []
+        while _time.monotonic() < deadline:
+            _time.sleep(2)
+            try:
+                h = httpx.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
+                if prompt_id in h:
+                    outputs = h[prompt_id].get("outputs", {})
+                    for node_id, node_out in outputs.items():
+                        for img in node_out.get("images", []):
+                            files.append({
+                                "filename": img["filename"],
+                                "subfolder": img.get("subfolder", ""),
+                                "type": img.get("type", "output"),
+                            })
+                    if files:
+                        break
+            except Exception:
+                pass
+
+        elapsed = round(_time.monotonic() - t0, 1)
+
+        if not files:
+            return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
+
+        # Run review on first image
+        review = {}
+        if files:
+            img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
+            if img_path.exists():
+                review = t_review_image(str(img_path), focus="prompt adherence, anatomy, character count")
+
+        return JSONResponse({
+            "files": files,
+            "prompt_id": prompt_id,
+            "checkpoint": ckpt,
+            "elapsed_s": elapsed,
+            "review_status": review.get("verdict", "unknown"),
+            "rating": review.get("rating"),
+            "auto_review": review.get("strengths", ""),
+            "total_attempts": 1,
+        })
+
+    @app.get("/api/output/{filename:path}")
+    async def api_output_file(filename: str):
+        """Serve a generated output file. Called by the droplet to download images."""
+        from fastapi.responses import FileResponse
+        # Check output dir and subdirs
+        for candidate in [OUTPUT_DIR / filename, COMFY_ROOT / "output" / filename]:
+            if candidate.exists() and candidate.is_file():
+                return FileResponse(str(candidate))
+        return JSONResponse({"error": "not found"}, status_code=404)
+
     demo.queue()
     app = gr.mount_gradio_app(app, demo, path="/",
                                allowed_paths=[str(OUTPUT_DIR)])
