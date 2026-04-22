@@ -1575,10 +1575,14 @@ if __name__ == "__main__":
             if merged is None:
                 merged = {k: v.float() * w for k, v in sd.items()}
             else:
+                skipped = 0
                 for k, v in sd.items():
-                    if k in merged:
+                    if k in merged and merged[k].shape == v.shape:
                         merged[k] += v.float() * w
-                    # Keys only in this model get added at full weight portion
+                    elif k in merged:
+                        skipped += 1  # shape mismatch, keep base model's version
+                if skipped:
+                    merge_info[-1]["skipped_keys"] = skipped
             del sd
             torch.cuda.empty_cache()
 
