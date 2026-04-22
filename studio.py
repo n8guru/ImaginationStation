@@ -2108,16 +2108,31 @@ RULES:
         import httpx
         t0 = _time.monotonic()
 
+        # Detect multi-person scenes → use gangbangDiffusion (SD1.5)
+        multi_hints = ["2people", "couple", "threesome", "group", "three people",
+                       "two women", "two men", "gangbang", "3people", "orgy",
+                       "three-person", "two-person", "both women", "all three"]
+        is_multi = any(h in description.lower() for h in multi_hints)
+
         # Find best checkpoint on disk
-        ckpt = "bigLove_ultra5.safetensors"
         ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
-        if ckpt_dir.exists():
-            available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
-            for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
-                match = [a for a in available if pref.lower() in a.lower()]
-                if match:
-                    ckpt = match[0]
-                    break
+        is_sd15 = False
+        if is_multi and (ckpt_dir / "gangbangDiffusion_v50.safetensors").exists():
+            ckpt = "gangbangDiffusion_v50.safetensors"
+            is_sd15 = True
+            resolution = 768  # SD1.5 sweet spot for multi-person
+            cfg = 8
+        else:
+            ckpt = "bigLove_ultra5.safetensors"
+            resolution = 1024
+            cfg = 7
+            if ckpt_dir.exists():
+                available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
+                for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
+                    match = [a for a in available if pref.lower() in a.lower()]
+                    if match:
+                        ckpt = match[0]
+                        break
 
         seed = random.randint(1, 9999999)
 
@@ -2156,9 +2171,9 @@ RULES:
             except Exception:
                 pass
 
-        # Build workflow — IPAdapter if reference images, plain txt2img otherwise
+        # Build workflow — IPAdapter if reference images (SDXL only), plain txt2img otherwise
         calibration_profile = None
-        if ref_local_paths:
+        if ref_local_paths and not is_sd15:
             import shutil, hashlib
             input_dir = COMFY_ROOT / "input"
             input_dir.mkdir(exist_ok=True)
@@ -2194,14 +2209,15 @@ RULES:
                 filename_prefix=filename_prefix,
             )
         else:
-            # Plain text-to-image
+            # Plain text-to-image (resolution/cfg set by checkpoint selection above)
             workflow = {
                 "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
                 "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
                 "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
-                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+                "4": {"class_type": "EmptyLatentImage", "inputs": {"width": resolution, "height": resolution, "batch_size": 1}},
                 "5": {"class_type": "KSampler", "inputs": {
-                    "seed": seed, "steps": 25, "cfg": 7, "sampler_name": "euler_ancestral",
+                    "seed": seed, "steps": 30 if is_sd15 else 25, "cfg": cfg,
+                    "sampler_name": "euler_ancestral",
                     "scheduler": "normal", "denoise": 1,
                     "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
                     "latent_image": ["4", 0]
