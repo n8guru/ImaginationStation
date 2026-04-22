@@ -1515,6 +1515,73 @@ if __name__ == "__main__":
             return JSONResponse({"status": "deleted"})
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    def _optimize_prompt(description, checkpoint, has_references,
+                         review_feedback=None, previous_pos=None, previous_neg=None):
+        """Use a fast LLM to convert a natural-language description into
+        optimized SD/SDXL positive + negative prompts for the given context.
+
+        Called pre-generation (no review_feedback) and in the review loop
+        (with review_feedback + previous prompts to fix).
+        """
+        api_key = _get_openrouter_key()
+        if not api_key:
+            # Fallback: basic formatting without LLM
+            return description, "bad anatomy, worst quality, low quality, blurry"
+
+        is_sdxl = any(k in checkpoint.lower() for k in ["sdxl", "biglove", "ultra", "analxl"])
+        token_limit = 154 if is_sdxl else 77
+
+        system = f"""You are an expert Stable Diffusion prompt engineer. Convert the user's image description into optimized prompts for ComfyUI.
+
+CONTEXT:
+- Checkpoint: {checkpoint} ({'SDXL' if is_sdxl else 'SD1.5'})
+- Token limit: ~{token_limit} tokens (be concise, use tags not sentences)
+- Reference images: {'YES — reference provides face/pose guidance, prompt controls content' if has_references else 'none'}
+
+RULES:
+1. POSITIVE PROMPT: Convert to comma-separated SD tags. Lead with character count tag (1girl, 2girls, 1boy, 3people, etc). Include: subject, action, composition, lighting, style, quality tags.
+2. NEGATIVE PROMPT: Context-appropriate negatives. Always include quality negatives (worst quality, low quality, blurry, bad anatomy, deformed, bad shadows, harsh shadows).
+3. CHARACTER COUNT: Count people described. Use exact tags: 1girl, 1boy, 2girls, 1boy 1girl, 3people, etc. NEVER add "solo" if multiple people are described.
+4. NUDITY: If the description requests nudity/explicit content, do NOT add clothing tags to positive. Add clothing terms to negative (clothes, dressed, shirt, fabric, etc).
+5. REFERENCE IMAGES: If references are present and description is nude, add strong clothing negatives since references may be clothed.
+6. ANATOMY: If specific anatomy is requested (anal, vaginal, etc), be explicit in positive and add the WRONG anatomy to negative (e.g. if anal requested, add "vaginal" to negative).
+7. Keep it tight — no verbose descriptions. Tags, not sentences."""
+
+        user_msg = f"DESCRIPTION: {description}"
+        if review_feedback:
+            user_msg += f"\n\n{review_feedback}"
+            user_msg += f"\n\nPREVIOUS POSITIVE: {previous_pos}"
+            user_msg += f"\n\nPREVIOUS NEGATIVE: {previous_neg}"
+            user_msg += "\n\nFix the prompts based on the review feedback. Keep what worked, fix what didn't."
+        else:
+            user_msg += "\n\nConvert this into optimized positive and negative prompts."
+
+        user_msg += '\n\nRespond with ONLY a JSON object: {"positive": "...", "negative": "..."}'
+
+        try:
+            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+            resp = client.chat.completions.create(
+                model="deepseek/deepseek-chat",  # fast + cheap for prompt formatting
+                max_tokens=500,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            text = resp.choices[0].message.content or ""
+            import re as _re
+            m = _re.search(r'\{.*\}', text, _re.DOTALL)
+            if m:
+                result = json.loads(m.group(0))
+                pos = result.get("positive", description)
+                neg = result.get("negative", "bad anatomy, worst quality, low quality, blurry")
+                return pos, neg
+        except Exception as e:
+            pass  # fall through to basic formatting
+
+        # Fallback if LLM fails
+        return description, "bad anatomy, worst quality, low quality, blurry, bad shadows"
+
     @app.post("/api/generate")
     async def api_generate(request: Request):
         """Bridge endpoint: text-to-image or reference-image-to-image generation.
@@ -1560,39 +1627,10 @@ if __name__ == "__main__":
 
         seed = random.randint(1, 9999999)
 
-        # Apply prompt engineering rules — only add solo tag if prompt doesn't
-        # already indicate character count (multi-person scenes must not get "1girl, solo")
-        pos = description
-        multi_hints = ["2people", "couple", "threesome", "group", "three", "two",
-                       "both", "together", "multiple", "3people", "2girls", "2boys",
-                       "three-person", "two-person"]
-        single_tags = ["1girl", "1boy", "1woman", "1man", "solo"]
-        has_count = any(tag in pos.lower() for tag in single_tags + multi_hints)
-        if not has_count:
-            pos = "1girl, solo, " + pos
-
-        is_multi = any(h in pos.lower() for h in multi_hints)
-        if is_multi:
-            neg = ("duplicate, clone, crowd, extra limbs, extra arms, extra hands, "
-                   "extra fingers, bad anatomy, deformed, disfigured, mutation, "
-                   "worst quality, low quality, blurry, watermark, text, "
-                   "bad shadows, harsh shadows")
-        else:
-            neg = ("multiple people, duplicate, clone, crowd, extra person, extra face, "
-                   "extra body, extra limbs, extra arms, extra hands, extra fingers, "
-                   "bad anatomy, deformed, disfigured, mutation, worst quality, "
-                   "low quality, blurry, watermark, text, bad shadows, harsh shadows")
-
-        # When reference images are used and prompt suggests nudity,
-        # reinforce clothing removal in negative prompt to fight reference bleed
-        if ref_images_raw or ref_image_data:
-            nude_keywords = ["nude", "naked", "topless", "undress", "strip",
-                             "nsfw", "explicit", "pussy", "penis", "breast",
-                             "nipple", "genital", "erect", "ass", "anal"]
-            if any(kw in pos.lower() for kw in nude_keywords):
-                neg += (", clothing, clothes, dressed, shirt, pants, skirt, dress, "
-                        "bra, underwear, panties, fabric, textile, garment, outfit, "
-                        "wearing clothes, partially clothed, covered")
+        # Smart prompt optimization — LLM rewrites description into proper
+        # SD/SDXL tag format with context-appropriate positive + negative prompts
+        has_refs = bool(ref_images_raw or ref_image_data)
+        pos, neg = _optimize_prompt(description, ckpt, has_refs)
 
         # Handle reference images — download URLs or resolve local paths
         ref_local_paths = []
@@ -1762,16 +1800,23 @@ if __name__ == "__main__":
             if rating >= 7 or verdict == "pass":
                 break
 
-            # Fail — apply prompt deltas and retry with new seed
+            # Fail — smart rewrite: LLM re-optimizes prompt using review feedback
             if attempt < MAX_ATTEMPTS:
-                pos_delta = review.get("positive_prompt_delta", "")
-                neg_delta = review.get("negative_prompt_delta", "")
-                if pos_delta:
-                    pos = pos + ", " + pos_delta
-                    workflow["2"]["inputs"]["text"] = pos
-                if neg_delta:
-                    neg = neg + ", " + neg_delta
-                    workflow["3"]["inputs"]["text"] = neg
+                review_feedback = (
+                    f"REVIEW FEEDBACK (attempt {attempt}, rating {rating}/10):\n"
+                    f"Weaknesses: {review.get('weaknesses', '')}\n"
+                    f"Anatomy issues: {review.get('anatomy_issues', '')}\n"
+                    f"Positive delta: {review.get('positive_prompt_delta', '')}\n"
+                    f"Negative delta: {review.get('negative_prompt_delta', '')}\n"
+                    f"Reference match: {review.get('reference_match', '')}"
+                )
+                pos, neg = _optimize_prompt(
+                    description, ckpt, has_refs,
+                    review_feedback=review_feedback,
+                    previous_pos=pos, previous_neg=neg,
+                )
+                workflow["2"]["inputs"]["text"] = pos
+                workflow["3"]["inputs"]["text"] = neg
                 # New seed for next attempt
                 seed = random.randint(1, 9999999)
                 workflow["5"]["inputs"]["seed"] = seed
