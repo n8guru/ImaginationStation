@@ -805,19 +805,20 @@ CSS = """
 footer {display:none !important}
 .gradio-container {max-width: 100% !important; padding: 8px !important;}
 .gradio-container > .main, .gradio-container .contain {max-width: 100% !important; padding: 0 !important;}
-#comfyframe {min-height: 900px;}
-#comfyframe iframe {width: 100%; height: 900px; border: 1px solid #444; border-radius: 8px;}
-.chatbot {height: 560px !important;}
+.chatbot {height: calc(100vh - 200px) !important;}
+#comfyframe iframe {width: 100%; height: 800px; border: 1px solid #444; border-radius: 8px;}
+#output-strip {overflow-y: auto; max-height: calc(100vh - 120px);}
+#output-strip .gallery-item {margin-bottom: 4px;}
 """
 
 with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
-    gr.Markdown("## 🎨 ComfyUI Studio — chat + canvas")
     api_state = gr.State([])
 
     with gr.Row():
-        # Left: chat (20%)
-        with gr.Column(scale=1, min_width=320):
+        # Left: chat (60%)
+        with gr.Column(scale=3, min_width=400):
             with gr.Row():
+                gr.Markdown("### Studio", scale=3)
                 model_pick = gr.Dropdown(
                     choices=MODEL_CHOICES, value=DEFAULT_MODEL, label="Model",
                     filterable=True, allow_custom_value=True, scale=4,
@@ -830,30 +831,37 @@ with gr.Blocks(title="ComfyUI Studio", fill_height=True) as demo:
             )
             chatbot = gr.Chatbot(elem_classes=["chatbot"], show_label=False,
                                  avatar_images=(None, "https://openrouter.ai/favicon.ico"))
-            msg = gr.Textbox(placeholder="e.g., Generate a cyberpunk portrait at 1024x1024 with Juggernaut",
+            msg = gr.Textbox(placeholder="Describe what you want to generate...",
                              lines=2, show_label=False)
             with gr.Row():
                 send_btn = gr.Button("Send", variant="primary", scale=3)
                 clear_btn = gr.Button("Clear", scale=1)
-            gr.HTML(
-                '<a href="http://localhost:7681" target="_blank" rel="noopener" '
-                'style="display:block;text-align:center;padding:8px 12px;margin-top:4px;'
-                'background:#b33;color:#fff;border-radius:6px;text-decoration:none;'
-                'font-weight:600;">🛟 Rescue terminal (Claude Code)</a>'
-            )
-            with gr.Accordion("Recent outputs", open=True):
-                gallery = gr.Gallery(value=refresh_gallery(), columns=4, height=480,
-                                     show_label=False, allow_preview=True)
-                with gr.Row():
-                    refresh_btn = gr.Button("Refresh", size="sm", scale=1)
-                    sync_btn = gr.Button("💾 Save to N8Razer", size="sm", scale=1,
-                                          variant="secondary")
-                sync_status = gr.Markdown("", visible=False)
-        # Right: ComfyUI iframe (80%)
-        with gr.Column(scale=4, elem_id="comfyframe"):
-            _comfy_host = _get_ts_hostname() or "localhost"
-            _comfy_url = f"http://{_comfy_host}.tail2b8e3e.ts.net:8188" if _comfy_host and _comfy_host != "localhost" else "http://localhost:8188"
-            gr.HTML(f'<iframe src="{_comfy_url}" allow="clipboard-write"></iframe>')
+
+        # Right: output strip (40%)
+        with gr.Column(scale=2, min_width=300, elem_id="output-strip"):
+            gr.Markdown("### Outputs")
+            gallery = gr.Gallery(value=refresh_gallery(), columns=2,
+                                 height="calc(100vh - 220px)",
+                                 show_label=False, allow_preview=True,
+                                 object_fit="contain")
+            with gr.Row():
+                refresh_btn = gr.Button("↻ Refresh", size="sm", scale=1)
+                sync_btn = gr.Button("💾 N8Razer", size="sm", scale=1,
+                                      variant="secondary")
+                rescue_btn = gr.Button("🛟 Rescue", size="sm", scale=1,
+                                        link="http://localhost:7681")
+            sync_status = gr.Markdown("", visible=False)
+
+    # ComfyUI workspace — collapsed by default
+    with gr.Accordion("ComfyUI workspace", open=False):
+        _comfy_host = _get_ts_hostname() or "localhost"
+        _comfy_url = f"http://{_comfy_host}.tail2b8e3e.ts.net:8188" if _comfy_host and _comfy_host != "localhost" else "http://localhost:8188"
+        gr.HTML(f'<iframe id="comfyframe" src="{_comfy_url}" allow="clipboard-write"'
+                f' style="width:100%;height:800px;border:1px solid #444;border-radius:8px;"></iframe>')
+
+    # Auto-refresh: poll gallery every 4s while chat is active
+    gallery_timer = gr.Timer(value=4, active=True)
+    gallery_timer.tick(refresh_gallery, None, gallery)
 
     # Wiring
     send_btn.click(chat, [msg, chatbot, api_state, api_key, model_pick],
