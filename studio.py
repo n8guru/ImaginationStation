@@ -1502,6 +1502,65 @@ if __name__ == "__main__":
     app = FastAPI()
 
     # Register custom API routes BEFORE mounting Gradio (which catches /)
+
+    @app.post("/api/pull_models")
+    async def api_pull_models(request: Request):
+        """Pull missing models from DO Spaces. Blocks until all downloads complete.
+
+        Body: {"filenames": ["umt5_xxl_fp8_e4m3fn_scaled.safetensors", ...]}
+        Returns: {"results": {filename: {status, path} or {error}}}
+
+        Called by comfy_client on the droplet when ComfyUI rejects a workflow
+        for missing models. Pulls from DO Spaces manifest, synchronous.
+        """
+        data = await request.json()
+        filenames = data.get("filenames", [])
+        if not filenames:
+            return JSONResponse({"error": "filenames list required"}, status_code=400)
+
+        bucket = os.environ.get("COMFY_S3_BUCKET", "imagination-models")
+        endpoint_url = os.environ.get("COMFY_S3_ENDPOINT", "https://sfo3.digitaloceanspaces.com")
+        access = os.environ.get("COMFY_S3_ACCESS_KEY", "")
+        secret = os.environ.get("COMFY_S3_SECRET_KEY", "")
+        if not (access and secret):
+            return JSONResponse({"error": "S3 credentials not configured"}, status_code=500)
+
+        results = {}
+        for fn in filenames:
+            row = _install_model_preflight(fn)
+            if not row:
+                results[fn] = {"error": f"not in manifest"}
+                continue
+            spaces_key = row["spaces_key"]
+            rel = spaces_key[len("models/"):] if spaces_key.startswith("models/") else spaces_key
+            dest = MODELS_DIR / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists() and dest.stat().st_size > 0:
+                results[fn] = {"status": "already_on_disk", "path": str(dest)}
+                continue
+            # Synchronous pull via s5cmd
+            try:
+                tmp_dest = dest.with_suffix(dest.suffix + ".part")
+                cmd = [
+                    "s5cmd", "--endpoint-url", endpoint_url,
+                    "cp", f"s3://{bucket}/{spaces_key}", str(tmp_dest),
+                ]
+                env = {**os.environ, "AWS_ACCESS_KEY_ID": access, "AWS_SECRET_ACCESS_KEY": secret}
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+                if r.returncode == 0 and tmp_dest.exists():
+                    tmp_dest.rename(dest)
+                    results[fn] = {"status": "pulled", "path": str(dest),
+                                   "size_mb": round(dest.stat().st_size / 1024 / 1024)}
+                else:
+                    tmp_dest.unlink(missing_ok=True)
+                    results[fn] = {"error": f"s5cmd failed: {r.stderr[:200]}"}
+            except subprocess.TimeoutExpired:
+                results[fn] = {"error": "download timed out (600s)"}
+            except Exception as e:
+                results[fn] = {"error": str(e)}
+
+        return JSONResponse({"results": results})
+
     @app.post("/api/delete_output")
     async def api_delete_output(request: Request):
         data = await request.json()
