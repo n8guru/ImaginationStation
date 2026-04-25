@@ -146,6 +146,18 @@ if [ -n "${COMFY_S3_ACCESS_KEY:-}" ] && [ -n "${COMFY_S3_SECRET_KEY:-}" ]; then
     export AWS_SECRET_ACCESS_KEY="$COMFY_S3_SECRET_KEY"
     S5="s5cmd --endpoint-url $ENDPOINT"
 
+    # Persist S3 creds to /etc/environment so post-bootstrap model pulls
+    # (via SSH, studio.py pull_model, s5cmd) can reach DO Spaces.
+    log "persisting S3 credentials to /etc/environment"
+    for var in COMFY_S3_ACCESS_KEY COMFY_S3_SECRET_KEY COMFY_S3_ENDPOINT COMFY_S3_BUCKET COMFY_S3_REGION; do
+        val="${!var:-}"
+        if [ -n "$val" ]; then
+            grep -q "^${var}=" /etc/environment 2>/dev/null && \
+                sed -i "s|^${var}=.*|${var}=\"${val}\"|" /etc/environment || \
+                echo "${var}=\"${val}\"" >> /etc/environment
+        fi
+    done
+
     # Pull manifest only — models are pulled on-demand by the director via
     # pull_model(). This avoids downloading 90+ GB at boot when only a few
     # models will be used per session.
