@@ -3,7 +3,7 @@ ComfyUI Studio — LLM chat + ComfyUI iframe on one page.
 LLM (via OpenRouter) has tool-calling access to ComfyUI API + shell.
 """
 import gradio as gr
-import os, json, time, subprocess, shlex, traceback
+import asyncio, os, json, time, subprocess, shlex, traceback
 from pathlib import Path
 import requests
 from openai import OpenAI
@@ -2315,8 +2315,9 @@ RULES:
                        "three-person", "two-person", "both women", "all three"]
         is_multi = any(h in description.lower() for h in multi_hints)
 
-        # Find best checkpoint on disk
+        # Find best checkpoint on disk — auto-pull from manifest if missing
         ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
         is_sd15 = False
         if is_multi and (ckpt_dir / "gangbangDiffusion_v50.safetensors").exists():
             ckpt = "gangbangDiffusion_v50.safetensors"
@@ -2327,13 +2328,31 @@ RULES:
             ckpt = "bigLove_ultra5.safetensors"
             resolution = 1024
             cfg = 7
-            if ckpt_dir.exists():
-                available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"]
+            available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"] if ckpt_dir.exists() else []
+            if available:
                 for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
                     match = [a for a in available if pref.lower() in a.lower()]
                     if match:
                         ckpt = match[0]
                         break
+            else:
+                # No checkpoints on disk — try to pull the default from manifest
+                pull_result = t_pull_model(ckpt)
+                if pull_result.get("error"):
+                    return JSONResponse({
+                        "error": f"No checkpoints on disk and auto-pull failed: {pull_result['error']}",
+                        "hint": "Pull a checkpoint via /api/pull_models first",
+                    }, status_code=503)
+                # Wait for the tmux pull to finish (poll dest file)
+                dest = Path(pull_result.get("dest", ""))
+                for _ in range(120):  # 10 min max
+                    if dest.exists() and dest.stat().st_size > 1_000_000:
+                        break
+                    await asyncio.sleep(5)
+                else:
+                    return JSONResponse({
+                        "error": f"Checkpoint pull timed out for {ckpt}",
+                    }, status_code=503)
 
         seed = random.randint(1, 9999999)
 
