@@ -87,7 +87,7 @@ source venv/bin/activate
 pip install --upgrade pip
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
-pip install gradio openai requests python-dotenv
+pip install gradio openai requests python-dotenv sageattention
 
 # 3. ComfyUI-Manager + key custom nodes
 mkdir -p custom_nodes
