@@ -2361,6 +2361,7 @@ RULES:
         forced_lora_weight = float(data.get("lora_weight", 0.8))
         forced_seed = data.get("seed")
         skip_review = data.get("skip_review", False)
+        skip_recipe = data.get("skip_recipe", False)
         max_attempts_override = data.get("max_attempts")
 
         if not description:
@@ -2448,7 +2449,7 @@ RULES:
 
         # Start from success: check for a proven recipe first, fall back to LLM optimizer
         has_refs = bool(ref_images_raw or ref_image_data)
-        recipe_match = _find_recipe(description, ckpt, has_refs)
+        recipe_match = None if skip_recipe else _find_recipe(description, ckpt, has_refs)
         if recipe_match:
             pos, neg = recipe_match
             prompt_source = "recipe"
