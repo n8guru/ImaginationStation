@@ -1868,7 +1868,7 @@ if __name__ == "__main__":
             "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
             "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
             "4": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
-            "11": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors"}},
+            "11": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip-vit-large-patch14.safetensors"}},
             "13": {"class_type": "IPAdapterModelLoader", "inputs": {
                 "ipadapter_file": "ip-adapter-plus_sdxl_vit-h.safetensors"
             }},
