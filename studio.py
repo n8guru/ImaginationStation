@@ -2551,6 +2551,10 @@ RULES:
         prompt_chain = [{"step": "initial", "source": prompt_source, "positive": pos, "negative": neg}]
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            # Use unique filename per attempt so intermediate images survive
+            attempt_prefix = f"{filename_prefix}_attempt{attempt}" if MAX_ATTEMPTS > 1 else filename_prefix
+            workflow["7"]["inputs"]["filename_prefix"] = attempt_prefix
+
             # Submit to ComfyUI
             try:
                 resp = httpx.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
