@@ -2317,6 +2317,8 @@ RULES:
         forced_lora = data.get("lora", "")
         forced_lora_weight = float(data.get("lora_weight", 0.8))
         forced_seed = data.get("seed")
+        skip_review = data.get("skip_review", False)
+        max_attempts_override = data.get("max_attempts")
 
         if not description:
             return JSONResponse({"error": "description is required"}, status_code=400)
@@ -2543,8 +2545,8 @@ RULES:
                 "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}},
             })
 
-        # Generate → review → iterate loop (up to 5 attempts)
-        MAX_ATTEMPTS = 3
+        # Generate → review → iterate loop
+        MAX_ATTEMPTS = int(max_attempts_override) if max_attempts_override else 3
         review = {}
         files = []
         all_attempts = []
@@ -2565,7 +2567,7 @@ RULES:
                 return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
 
             # Poll for completion
-            deadline = _time.monotonic() + 300
+            deadline = _time.monotonic() + 600  # 10 min per attempt (H100 is fast, but review LLM can be slow)
             files = []
             while _time.monotonic() < deadline:
                 _time.sleep(2)
@@ -2588,9 +2590,11 @@ RULES:
             if not files:
                 return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
 
-            # Review the generated image
+            # Review the generated image (skip if quick mode)
             img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
-            if img_path.exists():
+            if skip_review:
+                review = {"verdict": "skipped", "rating": 0}
+            elif img_path.exists():
                 review = t_review_image(
                     str(img_path),
                     focus="prompt adherence, anatomy, character count",
@@ -2613,9 +2617,10 @@ RULES:
                             "reference_match", "recommendation"]},
             })
 
-            # Pass (rating >= 7) — save recipe and done
-            if rating >= 7 or verdict == "pass":
-                _save_recipe(description, ckpt, pos, neg, rating, has_refs)
+            # Pass (rating >= 7) or quick mode — done
+            if rating >= 7 or verdict == "pass" or skip_review:
+                if rating >= 7:
+                    _save_recipe(description, ckpt, pos, neg, rating, has_refs)
                 break
 
             # Fail — smart rewrite: LLM re-optimizes prompt using review feedback
