@@ -2160,10 +2160,53 @@ if __name__ == "__main__":
                 "quality_tags": "masterpiece, best quality, detailed, photorealistic",
                 "style_notes": "Anime-derived but photorealistic capable. Good explicit anatomy.",
             },
+            "moodyPornMix": {
+                "arch": "SDXL", "trigger": "",
+                "quality_tags": "(masterpiece:1.2), (best quality:1.2), hyperdetailed, intricate details, 8k",
+                "style_notes": "DPO-trained SDXL. Hybrid prompting: natural language for scenes/mood, weighted tags for anatomy (1.1-1.3). Lead with subject then mood/lighting descriptors. CFG 4-6, DPM++ 3M SDE Karras.",
+            },
+            "illustriousRealism": {
+                "arch": "SDXL", "trigger": "",
+                "quality_tags": "(masterpiece:1.2), (best quality:1.2), ultra photorealistic, insanely detailed, 8k uhd",
+                "style_notes": "Illustrious-based SDXL. Natural language with realism descriptors upfront (hyperrealistic, pore-level skin). Use BREAK for prompt sectioning. CFG 4-7, DPM++ 3M SDE.",
+            },
+            "realvisxlV50_v50LightningBakedvae": {
+                "arch": "SDXL", "trigger": "",
+                "quality_tags": "",
+                "style_notes": "SDXL Lightning (distilled). NO quality tags needed — focus on subject description only. CRITICAL: CFG 1-2, steps 4-6. Higher values degrade quality. Simple direct natural language. Negative: worst quality, low quality, illustration, 3d, 2d, painting, cartoons, sketch.",
+                "cfg_override": 2, "steps_override": 6,
+            },
+            "uberrealisticDreamy": {
+                "arch": "SDXL", "trigger": "",
+                "quality_tags": "(masterpiece:1.3), (best quality:1.4), photorealistic, ultra detailed, sharp focus, cinematic",
+                "style_notes": "SDXL dreamy realism. Natural language over tags. Portrait/body descriptions first, then dreamy effects (soft glow, bokeh). CFG 3-5, Euler a.",
+            },
+            "juggernautXL_ragnarok": {
+                "arch": "SDXL", "trigger": "",
+                "quality_tags": "(masterpiece:1.3), (best quality:1.3), (highres:1.1)",
+                "style_notes": "SDXL v9 Ragnarok. Detailed natural language — be specific about subject, lighting, composition. Vague prompts underperform. Strong hands/anatomy. CFG 4-6 (sweet spot 5), Euler a.",
+            },
+            "zImageTurbo": {
+                "arch": "SDXL", "trigger": "",
+                "quality_tags": "",
+                "style_notes": "SDXL Turbo (few-step distilled). CRITICAL: CFG must be 0 — model ignores guidance, negative prompts have NO effect. All constraints go in positive prompt. Steps ~8. Use long structured natural language (80-250 words): shot+subject, age+appearance, clothing, environment, lighting, mood, style, camera/lens/film stock tags (Canon EOS, 50mm, Kodak Portra).",
+                "cfg_override": 0, "steps_override": 8,
+            },
             "gangbangDiffusion_v50": {
                 "arch": "SD1.5", "trigger": "",
                 "quality_tags": "masterpiece, best quality, detailed, photorealistic, realistic",
                 "style_notes": "SD1.5 model specialized for multi-person explicit scenes. Use Danbooru-style tags. Good at 2+ person compositions.",
+            },
+            "epicrealism_naturalSin": {
+                "arch": "SD1.5", "trigger": "",
+                "quality_tags": "",
+                "style_notes": "SD1.5 natural realism. LESS IS MORE — avoid quality tags like masterpiece (no effect). Avoid 'cinematic' (removes natural lighting). Avoid 'one girl' (pushes anime). Simple straightforward natural language. CFG 4-4.5, Euler a, 15-25 steps.",
+                "cfg_override": 4, "steps_override": 20,
+            },
+            "realisticVisionV60": {
+                "arch": "SD1.5", "trigger": "",
+                "quality_tags": "(masterpiece:1.3), (best quality:1.3), amazing quality, hyperrealistic",
+                "style_notes": "SD1.5 workhorse. 'raw photo of [subject]' format. Natural language with composition/lighting focus. Avoid over-tagging. Excels at skin textures and portraits. CFG 4.5-7.5, DPM++ 2M Karras.",
             },
             "dreamshaper_8": {
                 "arch": "SD1.5", "trigger": "",
@@ -2363,10 +2406,10 @@ RULES:
             if ckpt_info and ckpt_info.get("arch") == "SD1.5":
                 is_sd15 = True
                 resolution = 768
-                cfg = 8
+                cfg = ckpt_info["cfg_override"] if "cfg_override" in ckpt_info else 8
             else:
                 resolution = 1024
-                cfg = 7
+                cfg = ckpt_info["cfg_override"] if (ckpt_info and "cfg_override" in ckpt_info) else 7
         else:
             # Auto-select: always prefer SDXL (BigLove) when available.
             # gangbangDiffusion is SD 1.5 — only use as last resort on low-VRAM
@@ -2535,7 +2578,8 @@ RULES:
                 "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip_ref}},
                 "4": {"class_type": "EmptyLatentImage", "inputs": {"width": resolution, "height": resolution, "batch_size": 1}},
                 "5": {"class_type": "KSampler", "inputs": {
-                    "seed": seed, "steps": 30 if is_sd15 else 25, "cfg": cfg,
+                    "seed": seed, "cfg": cfg,
+                    "steps": ckpt_info["steps_override"] if (ckpt_info and "steps_override" in ckpt_info) else (30 if is_sd15 else 25),
                     "sampler_name": "euler_ancestral",
                     "scheduler": "normal", "denoise": 1,
                     "model": model_ref, "positive": ["2", 0], "negative": ["3", 0],
