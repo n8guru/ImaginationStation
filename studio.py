@@ -2664,7 +2664,7 @@ RULES:
 
             # Pass (rating >= 7) or quick mode — done
             if rating >= 7 or verdict == "pass" or skip_review:
-                if rating >= 7:
+                if rating >= 7 and not skip_recipe:
                     _save_recipe(description, ckpt, pos, neg, rating, has_refs)
                 break
 

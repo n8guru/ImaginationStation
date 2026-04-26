@@ -8,6 +8,10 @@
 # `tailscale up` in bootstrap.sh.
 set -u
 
+# Source persisted env vars (S3 creds, hostname, etc.)
+# bootstrap.sh writes these during first boot
+[ -f /etc/environment ] && set -a && . /etc/environment && set +a
+
 for s in comfyui studio rescue; do
     tmux has-session -t "$s" 2>/dev/null && tmux kill-session -t "$s"
 done
