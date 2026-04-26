@@ -2298,6 +2298,13 @@ RULES:
         data = await request.json()
         description = (data.get("description") or "").strip()
         filename_prefix = data.get("filename_prefix", "gen")
+
+        # Persist the API key if provided — enables the review loop (Grok vision)
+        # and prompt optimizer (Grok) to work on this instance.
+        incoming_key = data.get("api_key", "")
+        if incoming_key and incoming_key.strip():
+            API_KEY_FILE.write_text(incoming_key.strip())
+
         # reference_images: list of paths/URLs, or single string for backward compat
         ref_images_raw = data.get("reference_images", [])
         if not ref_images_raw:
