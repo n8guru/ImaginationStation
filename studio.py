@@ -2359,29 +2359,21 @@ RULES:
                 resolution = 1024
                 cfg = 7
         else:
-            # Auto-select: multi-person → gangbangDiffusion, else BigLove
-            multi_hints = ["2people", "couple", "threesome", "group", "three people",
-                           "two women", "two men", "gangbang", "3people", "orgy",
-                           "three-person", "two-person", "both women", "all three"]
-            is_multi = any(h in description.lower() for h in multi_hints)
-
-            if is_multi and (ckpt_dir / "gangbangDiffusion_v50.safetensors").exists():
-                ckpt = "gangbangDiffusion_v50.safetensors"
-                is_sd15 = True
-                resolution = 768  # SD1.5 sweet spot for multi-person
-                cfg = 8
-            else:
-                ckpt = "bigLove_ultra5.safetensors"
-                resolution = 1024
-                cfg = 7
-                available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"] if ckpt_dir.exists() else []
-                if available:
-                    for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
-                        match = [a for a in available if pref.lower() in a.lower()]
-                        if match:
-                            ckpt = match[0]
-                            break
-                else:
+            # Auto-select: always prefer SDXL (BigLove) when available.
+            # gangbangDiffusion is SD 1.5 — only use as last resort on low-VRAM
+            # machines. On H100/A100/L40S with 24GB+ VRAM, SDXL is always better
+            # for multi-person scenes with proper prompting.
+            ckpt = "bigLove_ultra5.safetensors"
+            resolution = 1024
+            cfg = 7
+            available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"] if ckpt_dir.exists() else []
+            if available:
+                for pref in ["forage_v", "bigLove", "sdxl", "analXL"]:
+                    match = [a for a in available if pref.lower() in a.lower()]
+                    if match:
+                        ckpt = match[0]
+                        break
+            if not available:
                     # No checkpoints on disk — try to pull the default from manifest
                     pull_result = t_pull_model(ckpt)
                     if pull_result.get("error"):
