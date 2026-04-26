@@ -2444,6 +2444,20 @@ RULES:
         # Build workflow — IPAdapter if reference images (SDXL only), plain txt2img otherwise
         calibration_profile = None
         if ref_local_paths and not is_sd15:
+            # Auto-pull IPAdapter + CLIP vision models if missing
+            ipa_model = MODELS_DIR / "ipadapter" / "ip-adapter-plus_sdxl_vit-h.safetensors"
+            clip_model = MODELS_DIR / "clip_vision" / "clip-vit-large-patch14.safetensors"
+            for model_path in [ipa_model, clip_model]:
+                if not model_path.exists():
+                    model_path.parent.mkdir(parents=True, exist_ok=True)
+                    pull_result = t_pull_model(model_path.name)
+                    if pull_result.get("dest"):
+                        dest = Path(pull_result["dest"])
+                        for _ in range(60):  # 5 min max
+                            if dest.exists() and dest.stat().st_size > 1_000_000:
+                                break
+                            await asyncio.sleep(5)
+
             import shutil, hashlib
             input_dir = COMFY_ROOT / "input"
             input_dir.mkdir(exist_ok=True)
