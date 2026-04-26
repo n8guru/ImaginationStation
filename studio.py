@@ -2288,6 +2288,12 @@ RULES:
                 OR a URL to download. Triggers IPAdapter workflow.
             reference_image_data (str, optional): base64-encoded image data
             reference_weight (float, optional): IPAdapter strength 0-1, default 0.8
+            checkpoint (str, optional): force a specific checkpoint filename.
+                Overrides auto-selection. Must exist on disk or in manifest.
+            lora (str, optional): LoRA filename to apply (e.g. "anal_licking.safetensors").
+                Applied via LoraLoader node in the workflow.
+            lora_weight (float, optional): LoRA strength 0-1, default 0.8.
+            seed (int, optional): fixed seed for reproducibility.
         """
         data = await request.json()
         description = (data.get("description") or "").strip()
@@ -2300,6 +2306,10 @@ RULES:
                 ref_images_raw = [single]
         ref_image_data = data.get("reference_image_data", "")
         ref_weight = float(data.get("reference_weight", 0.3))
+        forced_checkpoint = data.get("checkpoint", "")
+        forced_lora = data.get("lora", "")
+        forced_lora_weight = float(data.get("lora_weight", 0.8))
+        forced_seed = data.get("seed")
 
         if not description:
             return JSONResponse({"error": "description is required"}, status_code=400)
@@ -2309,52 +2319,88 @@ RULES:
         import httpx
         t0 = _time.monotonic()
 
-        # Detect multi-person scenes → use gangbangDiffusion (SD1.5)
-        multi_hints = ["2people", "couple", "threesome", "group", "three people",
-                       "two women", "two men", "gangbang", "3people", "orgy",
-                       "three-person", "two-person", "both women", "all three"]
-        is_multi = any(h in description.lower() for h in multi_hints)
-
         # Find best checkpoint on disk — auto-pull from manifest if missing
         ckpt_dir = COMFY_ROOT / "models" / "checkpoints"
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         is_sd15 = False
-        if is_multi and (ckpt_dir / "gangbangDiffusion_v50.safetensors").exists():
-            ckpt = "gangbangDiffusion_v50.safetensors"
-            is_sd15 = True
-            resolution = 768  # SD1.5 sweet spot for multi-person
-            cfg = 8
-        else:
-            ckpt = "bigLove_ultra5.safetensors"
-            resolution = 1024
-            cfg = 7
-            available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"] if ckpt_dir.exists() else []
-            if available:
-                for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
-                    match = [a for a in available if pref.lower() in a.lower()]
-                    if match:
-                        ckpt = match[0]
-                        break
-            else:
-                # No checkpoints on disk — try to pull the default from manifest
+
+        if forced_checkpoint:
+            # Caller requested a specific checkpoint
+            ckpt = forced_checkpoint
+            if not ckpt.endswith(".safetensors"):
+                ckpt += ".safetensors"
+            if not (ckpt_dir / ckpt).exists():
+                # Try to auto-pull from manifest
                 pull_result = t_pull_model(ckpt)
                 if pull_result.get("error"):
                     return JSONResponse({
-                        "error": f"No checkpoints on disk and auto-pull failed: {pull_result['error']}",
-                        "hint": "Pull a checkpoint via /api/pull_models first",
-                    }, status_code=503)
-                # Wait for the tmux pull to finish (poll dest file)
+                        "error": f"Requested checkpoint not on disk and auto-pull failed: {ckpt}",
+                        "hint": "Use /api/pull_models or check available checkpoints with list_models",
+                    }, status_code=404)
                 dest = Path(pull_result.get("dest", ""))
-                for _ in range(120):  # 10 min max
+                for _ in range(120):
                     if dest.exists() and dest.stat().st_size > 1_000_000:
                         break
                     await asyncio.sleep(5)
                 else:
-                    return JSONResponse({
-                        "error": f"Checkpoint pull timed out for {ckpt}",
-                    }, status_code=503)
+                    return JSONResponse({"error": f"Checkpoint pull timed out for {ckpt}"}, status_code=503)
+            # Determine arch from MODEL_KNOWLEDGE or filename heuristics
+            ckpt_base = ckpt.replace(".safetensors", "")
+            ckpt_info = None
+            for key, info in MODEL_KNOWLEDGE["checkpoints"].items():
+                if key.lower() in ckpt_base.lower():
+                    ckpt_info = info
+                    break
+            if ckpt_info and ckpt_info.get("arch") == "SD1.5":
+                is_sd15 = True
+                resolution = 768
+                cfg = 8
+            else:
+                resolution = 1024
+                cfg = 7
+        else:
+            # Auto-select: multi-person → gangbangDiffusion, else BigLove
+            multi_hints = ["2people", "couple", "threesome", "group", "three people",
+                           "two women", "two men", "gangbang", "3people", "orgy",
+                           "three-person", "two-person", "both women", "all three"]
+            is_multi = any(h in description.lower() for h in multi_hints)
 
-        seed = random.randint(1, 9999999)
+            if is_multi and (ckpt_dir / "gangbangDiffusion_v50.safetensors").exists():
+                ckpt = "gangbangDiffusion_v50.safetensors"
+                is_sd15 = True
+                resolution = 768  # SD1.5 sweet spot for multi-person
+                cfg = 8
+            else:
+                ckpt = "bigLove_ultra5.safetensors"
+                resolution = 1024
+                cfg = 7
+                available = [f.name for f in ckpt_dir.iterdir() if f.suffix == ".safetensors"] if ckpt_dir.exists() else []
+                if available:
+                    for pref in ["forage_v", "bigLove", "sdxl", "analXL", "dreamshaper"]:
+                        match = [a for a in available if pref.lower() in a.lower()]
+                        if match:
+                            ckpt = match[0]
+                            break
+                else:
+                    # No checkpoints on disk — try to pull the default from manifest
+                    pull_result = t_pull_model(ckpt)
+                    if pull_result.get("error"):
+                        return JSONResponse({
+                            "error": f"No checkpoints on disk and auto-pull failed: {pull_result['error']}",
+                            "hint": "Pull a checkpoint via /api/pull_models first",
+                        }, status_code=503)
+                    # Wait for the tmux pull to finish (poll dest file)
+                    dest = Path(pull_result.get("dest", ""))
+                    for _ in range(120):  # 10 min max
+                        if dest.exists() and dest.stat().st_size > 1_000_000:
+                            break
+                        await asyncio.sleep(5)
+                    else:
+                        return JSONResponse({
+                            "error": f"Checkpoint pull timed out for {ckpt}",
+                        }, status_code=503)
+
+        seed = int(forced_seed) if forced_seed is not None else random.randint(1, 9999999)
 
         # Start from success: check for a proven recipe first, fall back to LLM optimizer
         has_refs = bool(ref_images_raw or ref_image_data)
@@ -2435,21 +2481,54 @@ RULES:
             )
         else:
             # Plain text-to-image (resolution/cfg set by checkpoint selection above)
+            # If a LoRA is requested, insert a LoraLoader between checkpoint and sampler
+            model_ref = ["1", 0]  # default: straight from checkpoint
+            clip_ref = ["1", 1]
             workflow = {
                 "1": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
-                "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": ["1", 1]}},
-                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["1", 1]}},
+            }
+            if forced_lora:
+                lora_name = forced_lora
+                if not lora_name.endswith(".safetensors"):
+                    lora_name += ".safetensors"
+                lora_dir = COMFY_ROOT / "models" / "loras"
+                if not (lora_dir / lora_name).exists():
+                    # Try auto-pull
+                    pull_result = t_pull_model(lora_name)
+                    if pull_result.get("error"):
+                        return JSONResponse({
+                            "error": f"Requested LoRA not on disk and auto-pull failed: {lora_name}",
+                        }, status_code=404)
+                    dest = Path(pull_result.get("dest", ""))
+                    for _ in range(60):
+                        if dest.exists() and dest.stat().st_size > 10_000:
+                            break
+                        await asyncio.sleep(5)
+
+                workflow["10"] = {"class_type": "LoraLoader", "inputs": {
+                    "lora_name": lora_name,
+                    "strength_model": forced_lora_weight,
+                    "strength_clip": forced_lora_weight,
+                    "model": ["1", 0],
+                    "clip": ["1", 1],
+                }}
+                model_ref = ["10", 0]
+                clip_ref = ["10", 1]
+
+            workflow.update({
+                "2": {"class_type": "CLIPTextEncode", "inputs": {"text": pos, "clip": clip_ref}},
+                "3": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": clip_ref}},
                 "4": {"class_type": "EmptyLatentImage", "inputs": {"width": resolution, "height": resolution, "batch_size": 1}},
                 "5": {"class_type": "KSampler", "inputs": {
                     "seed": seed, "steps": 30 if is_sd15 else 25, "cfg": cfg,
                     "sampler_name": "euler_ancestral",
                     "scheduler": "normal", "denoise": 1,
-                    "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
+                    "model": model_ref, "positive": ["2", 0], "negative": ["3", 0],
                     "latent_image": ["4", 0]
                 }},
                 "6": {"class_type": "VAEDecode", "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
                 "7": {"class_type": "SaveImage", "inputs": {"filename_prefix": filename_prefix, "images": ["6", 0]}},
-            }
+            })
 
         # Generate → review → iterate loop (up to 5 attempts)
         MAX_ATTEMPTS = 3
@@ -2556,6 +2635,10 @@ RULES:
             "files": files,
             "prompt_id": prompt_id,
             "checkpoint": ckpt,
+            "lora": forced_lora or None,
+            "lora_weight": forced_lora_weight if forced_lora else None,
+            "seed": seed,
+            "is_sd15": is_sd15,
             "prompt_source": prompt_source,
             "has_reference": bool(ref_local_paths),
             "reference_count": len(ref_local_paths),
