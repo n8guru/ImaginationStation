@@ -2612,9 +2612,10 @@ RULES:
             except Exception as e:
                 return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
 
-            # Poll for completion — no timeout, jobs wait in queue until ComfyUI picks them up
+            # Poll for completion — 30 min max per attempt (generous for queue backlog)
+            _poll_deadline = _time.monotonic() + 1800
             files = []
-            while True:
+            while _time.monotonic() < _poll_deadline:
                 _time.sleep(2)
                 try:
                     h = httpx.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
@@ -2631,6 +2632,9 @@ RULES:
                             break
                 except Exception:
                     pass
+
+            if not files:
+                return JSONResponse({"error": "Generation timed out after 30min", "prompt_id": prompt_id}, status_code=504)
 
             # Review the generated image (skip if quick mode)
             img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
