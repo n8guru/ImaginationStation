@@ -166,9 +166,10 @@ def t_get_history(n=5):
         out[pid] = {"files": files, "status": h.get("status", {}).get("status_str", "unknown")}
     return out
 
-def t_wait_for_image(prompt_id, timeout_s=180):
-    deadline = time.time() + int(timeout_s)
-    while time.time() < deadline:
+def t_wait_for_image(prompt_id, timeout_s=0):
+    start = time.time()
+    deadline = (time.time() + int(timeout_s)) if timeout_s else 0
+    while not deadline or time.time() < deadline:
         h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
         if prompt_id in h:
             outputs = h[prompt_id].get("outputs", {})
@@ -182,7 +183,7 @@ def t_wait_for_image(prompt_id, timeout_s=180):
                         "view_url": f"{COMFY_URL}/view?filename={img['filename']}&subfolder={img.get('subfolder','')}&type={img.get('type','output')}",
                     })
             if files:
-                return {"status": "done", "files": files, "elapsed_s": round(time.time() - (deadline - int(timeout_s)), 1)}
+                return {"status": "done", "files": files, "elapsed_s": round(time.time() - start, 1)}
         time.sleep(1.5)
     return {"status": "timeout", "after_s": timeout_s}
 
@@ -2611,10 +2612,9 @@ RULES:
             except Exception as e:
                 return JSONResponse({"error": f"ComfyUI submit failed: {e}"}, status_code=500)
 
-            # Poll for completion
-            deadline = _time.monotonic() + 600  # 10 min per attempt (H100 is fast, but review LLM can be slow)
+            # Poll for completion — no timeout, jobs wait in queue until ComfyUI picks them up
             files = []
-            while _time.monotonic() < deadline:
+            while True:
                 _time.sleep(2)
                 try:
                     h = httpx.get(f"{COMFY_URL}/history/{prompt_id}", timeout=5).json()
@@ -2631,9 +2631,6 @@ RULES:
                             break
                 except Exception:
                     pass
-
-            if not files:
-                return JSONResponse({"error": "Generation timed out", "prompt_id": prompt_id}, status_code=504)
 
             # Review the generated image (skip if quick mode)
             img_path = OUTPUT_DIR / files[0].get("subfolder", "") / files[0]["filename"]
